@@ -10,6 +10,7 @@ import { extractArticleInfo, findAlternativeArticles } from './newsapi.js'
 import { ai } from './ai.js'
 import { collectFacts, collectVideos, collectTitleByUrl, describeFactsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
 import { extractFallbackKeywords, describeFallbackKeywordsSettings } from './fallback-keywords.js'
+import { logRunApiStats, logRunTotalCost } from './cost.js'
 
 const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
@@ -152,6 +153,26 @@ function isYoutubeUrl(value) {
 	}
 }
 
+function isDirectYoutubeVideoUrl(value) {
+	if (!isYoutubeUrl(value)) return false
+	try {
+		let u = new URL(String(value).trim())
+		let host = u.hostname.toLowerCase().replace(/^www\./, '')
+		if (host === 'youtu.be') {
+			let id = String(u.pathname || '').replace(/^\/+/, '').split('/')[0]
+			return !!id
+		}
+		if (!(host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com'))) return false
+		if (u.pathname === '/watch') return !!u.searchParams.get('v')
+		if (/^\/embed\/[^/?#]+/.test(u.pathname)) return true
+		if (/^\/shorts\/[^/?#]+/.test(u.pathname)) return true
+		if (/^\/live\/[^/?#]+/.test(u.pathname)) return true
+		return false
+	} catch {
+		return false
+	}
+}
+
 function normalizeVideoUrls(value) {
 	let text = String(value ?? '').trim()
 	if (!text) return ''
@@ -159,7 +180,7 @@ function normalizeVideoUrls(value) {
 	let urls = uniq(
 		matches
 			.map(u => String(u).replace(/[),.;!?]+$/g, '').trim())
-			.filter(isYoutubeUrl)
+			.filter(isDirectYoutubeVideoUrl)
 	)
 	return urls.join('\n')
 }
@@ -209,6 +230,30 @@ function wrapHtml({ url, html, text }) {
 		return `<!--\n${url}\n-->\n<pre>${escapeHtml(text)}</pre>`
 	}
 	return `<!--\n${url}\n-->`
+}
+
+function missingProcessingFields(e) {
+	let missing = []
+	if (!hasMeaningfulText(e.summary)) missing.push('summary')
+	if (!hasMeaningfulText(e.factsRu)) missing.push('factsRu')
+	if (!hasVideoLinks(e.videoUrls)) missing.push('videoUrls')
+	if (!hasMeaningfulText(e.usedUrl)) missing.push('usedUrl')
+	return missing
+}
+
+function processingDecision(e) {
+	if (e.topic === 'other') {
+		return { shouldProcess: false, reason: 'topic=other', missing: [] }
+	}
+	let missing = missingProcessingFields(e)
+	if (!missing.length) {
+		return { shouldProcess: false, reason: 'already_complete', missing: [] }
+	}
+	return {
+		shouldProcess: true,
+		reason: `needs=${missing.join(',')}`,
+		missing,
+	}
 }
 
 async function extractVerified(url) {
@@ -323,19 +368,53 @@ async function tryOtherAgencies(e) {
 }
 
 export async function summarize() {
-	ensureColumns(news, ['url', 'usedUrl', 'alternativeUrls', 'factsRu', 'videoUrls'])
+	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'videoUrls'])
 
 	news.forEach((e, i) => e.id ||= i + 1)
 
-	let list = news.filter(e => (
-		e.topic !== 'other'
-		&& (
-			!hasMeaningfulText(e.summary)
-			|| !hasMeaningfulText(e.factsRu)
-			|| !hasVideoLinks(e.videoUrls)
-			|| !hasMeaningfulText(e.usedUrl)
+	let rows = news.map((e, rowIndex) => {
+		let decision = processingDecision(e)
+		let dedupeKey = normalizeHttpUrl(e.usedUrl || e.url)
+		if (!dedupeKey && e.gnUrl) dedupeKey = String(e.gnUrl).trim()
+		return { e, rowIndex, dedupeKey, ...decision }
+	})
+	let runRows = rows.filter(row => row.shouldProcess)
+	for (let i = 0; i < runRows.length; i++) {
+		runRows[i].runIndex = i + 1
+	}
+	let firstRunIndexByDedupeKey = new Map()
+	for (let row of runRows) {
+		if (!row.dedupeKey) continue
+		let firstRunIndex = firstRunIndexByDedupeKey.get(row.dedupeKey)
+		if (firstRunIndex != null) {
+			row.skipReason = `duplicate_of_row=${firstRunIndex}`
+			continue
+		}
+		firstRunIndexByDedupeKey.set(row.dedupeKey, row.runIndex)
+	}
+	let list = runRows.filter(row => !row.skipReason)
+	let skipped = runRows.filter(row => !!row.skipReason)
+	log(
+		'SUMMARIZE_ROWS',
+		`total=${runRows.length}`,
+		`to_process=${list.length}`,
+		`skipped=${skipped.length}`,
+	)
+	let skippedByReason = {}
+	for (let row of skipped) {
+		skippedByReason[row.skipReason] = (skippedByReason[row.skipReason] || 0) + 1
+		let title = row.e.titleEn || row.e.titleRu || ''
+		log(
+			`\n#${row.runIndex} [${row.runIndex}/${runRows.length}] SKIP`,
+			`reason=${row.skipReason}`,
+			title,
 		)
-	))
+	}
+	let skippedReasonParts = Object.entries(skippedByReason)
+		.map(([reason, count]) => `${reason}=${count}`)
+	if (skippedReasonParts.length) {
+		log('SUMMARIZE_SKIP_REASONS', ...skippedReasonParts)
+	}
 
 	let stats = { ok: 0, fail: 0 }
 	let last = {
@@ -345,11 +424,22 @@ export async function summarize() {
 		videos: { time: 0, delay: 0 },
 	}
 	for (let i = 0; i < list.length; i++) {
-		let e = list[i]
-		log(`\n#${e.id} [${i + 1}/${list.length}]`, e.titleEn || e.titleRu || '')
+		let row = list[i]
+		let e = row.e
+		log(
+			`\n#${row.runIndex} [${row.runIndex}/${runRows.length}]`,
+			`work=${i + 1}/${list.length}`,
+			`reason=${row.reason}`,
+			e.titleEn || e.titleRu || '',
+		)
 		let articleText = ''
 
 		if (!e.url /*&& !restricted.includes(e.source)*/) {
+			if (!e.gnUrl) {
+				log('SKIP processing: missing url and gnUrl')
+				stats.fail++
+				continue
+			}
 			e.url = await decodeWithThrottle(last, e.gnUrl)
 			if (!e.url) {
 				await sleep(5*60e3)
@@ -519,6 +609,8 @@ export async function summarize() {
 	await save()
 
 	log('\n', stats)
+	logRunTotalCost({ task: 'summarize', logger: log })
+	logRunApiStats({ task: 'summarize', logger: log })
 }
 
 if (process.argv[1].endsWith('summarize')) summarize()

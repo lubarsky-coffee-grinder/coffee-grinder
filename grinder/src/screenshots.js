@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises'
 import { join } from 'path'
 import OpenAI from 'openai'
 import { log } from './log.js'
+import { estimateAndLogCost, logRunTotalCost } from './cost.js'
 
 const IMG_DIR = join(import.meta.dirname, '../../img')
 const SCREENSHOTS_FILE = join(IMG_DIR, 'screenshots.txt')
@@ -395,8 +396,14 @@ async function askVisionAction(page, { url, check }) {
 					{ type: 'image_url', image_url: { url: imageUrl } },
 				],
 			},
-		],
-	}), VISION_TIMEOUT_MS, 'gpt_vision')
+			],
+		}), VISION_TIMEOUT_MS, 'gpt_vision')
+	estimateAndLogCost({
+		task: 'screenshot_vision',
+		model: OPENAI_SCREENSHOT_MODEL,
+		usage: response?.usage,
+		logger: log,
+	})
 
 	let content = response?.choices?.[0]?.message?.content || ''
 	if (Array.isArray(content)) {
@@ -548,6 +555,7 @@ export async function screenshots() {
 		content = await readFile(SCREENSHOTS_FILE, 'utf-8')
 	} catch {
 		log('No screenshots.txt found')
+		logRunTotalCost({ task: 'screenshots', logger: log })
 		return
 	}
 
@@ -561,6 +569,7 @@ export async function screenshots() {
 
 	if (items.length === 0) {
 		log('No screenshots to take')
+		logRunTotalCost({ task: 'screenshots', logger: log })
 		return
 	}
 
@@ -602,6 +611,7 @@ export async function screenshots() {
 		.map(([k, v]) => `${k}=${v}`)
 		.join(' ')
 	log(`Screenshots done. total=${stats.total} ok=${stats.ok} fail=${stats.fail}${issueParts ? ` ${issueParts}` : ''}`)
+	logRunTotalCost({ task: 'screenshots', logger: log })
 }
 
 if (process.argv[1]?.includes('screenshots')) screenshots()

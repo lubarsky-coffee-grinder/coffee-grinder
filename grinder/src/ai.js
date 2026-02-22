@@ -4,6 +4,7 @@ import { spreadsheetId } from './store.js'
 import { log } from './log.js'
 import { sleep } from './sleep.js'
 import { getPrompt } from './prompts.js'
+import { estimateAndLogCost } from './cost.js'
 
 const openai = new OpenAI()
 
@@ -59,6 +60,18 @@ function isModelNotFound(e) {
 	return e?.code === 'model_not_found' || e?.status === 404
 }
 
+function isTransientApiError(e) {
+	let status = Number(e?.status || e?.statusCode || e?.response?.status)
+	if (status === 429) return true
+	if (status >= 500 && status <= 599) return true
+
+	let code = String(e?.code || e?.error?.code || '').toUpperCase()
+	if (code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'ECONNABORTED' || code === 'EAI_AGAIN') return true
+
+	let message = `${e?.message || ''} ${e?.error?.message || ''}`.toLowerCase()
+	return message.includes('timeout')
+}
+
 function isTemperatureUnsupported(e) {
 	const code = e?.code
 	const nested = e?.error?.code
@@ -85,6 +98,12 @@ async function chatSummarize({ url, text, logger = log }) {
 	if (summaryTemperature !== undefined) request.temperature = summaryTemperature
 
 	let res = await openai.chat.completions.create(request)
+	estimateAndLogCost({
+		task: 'summary',
+		model,
+		usage: res?.usage,
+		logger,
+	})
 
 	let msg = res?.choices?.[0]?.message?.content
 	if (!msg) return null
@@ -111,32 +130,43 @@ async function chatSummarize({ url, text, logger = log }) {
 export async function ai({ url, text, logger = log }) {
 	await init
 
-	for (let i = 0; i < 3; i++) {
+	let retriedTransient = false
+	for (;;) {
 		try {
 			let res = await chatSummarize({ url, text, logger })
 			if (res) return res
-			await sleep(30e3)
+			logger('AI summarize: empty result')
+			return null
 		} catch (e) {
 			if (isTemperatureUnsupported(e) && summaryTemperature !== undefined) {
 				summaryTemperature = undefined
 				logger('AI summarize: temperature unsupported, retrying without temperature', '\n', e)
 				logger('AI summarize:', describeSummarizeSettings(model))
-				i--
 				continue
 			}
 
-			if ((isUnsupportedModel(e) || isModelNotFound(e)) && !explicitModel && model !== FALLBACK_OPENAI_MODEL) {
-				logger('AI model failed:', model, '\nFalling back to:', FALLBACK_OPENAI_MODEL, '\n', e)
+			if (isModelNotFound(e) && !explicitModel && model !== FALLBACK_OPENAI_MODEL) {
+				logger('AI model not found:', model, '\nFalling back to:', FALLBACK_OPENAI_MODEL, '\n', e)
 				model = FALLBACK_OPENAI_MODEL
 				summaryTemperature = temperatureForModel(model)
 				logger('AI summarize:', describeSummarizeSettings(model))
-				i--
 				continue
 			}
 
+			if (isTransientApiError(e) && !retriedTransient) {
+				retriedTransient = true
+				logger('AI summarize: transient error, retrying once', '\n', e)
+				await sleep(1500)
+				continue
+			}
+
+			if (isUnsupportedModel(e)) {
+				logger('AI summarize: unsupported model\n', e)
+				return null
+			}
+
 			logger('AI fail\n', e)
-			await sleep(30e3)
+			return null
 		}
 	}
-	return null
 }

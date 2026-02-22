@@ -2,6 +2,7 @@ import { log } from './log.js'
 import { htmlToText } from './html-to-text.js'
 import { fetchArticle } from './fetch-article.js'
 import { JSDOM } from 'jsdom'
+import { trackApiRequest, trackApiResult } from './cost.js'
 
 const ER_API_BASE = 'https://eventregistry.org/api/v1'
 const ER_ANALYTICS_BASE = 'https://analytics.eventregistry.org/api/v1'
@@ -38,6 +39,52 @@ function pickString(obj, paths) {
 		let v = get(obj, path)
 		if (typeof v === 'string' && v.trim()) return v
 	}
+}
+
+function normalizePublishedAt(value) {
+	if (value == null || value === '') return ''
+	if (value instanceof Date) {
+		let ms = value.getTime()
+		return Number.isFinite(ms) ? new Date(ms).toISOString() : ''
+	}
+	if (typeof value === 'number') {
+		let ms = value
+		if (ms > 0 && ms < 1e11) ms *= 1000
+		let d = new Date(ms)
+		return Number.isFinite(d.getTime()) ? d.toISOString() : ''
+	}
+
+	let text = String(value).trim()
+	if (!text) return ''
+
+	let d = new Date(text)
+	if (Number.isFinite(d.getTime())) return d.toISOString()
+
+	let compact = text.match(/^(\d{4})(\d{2})(\d{2})$/)
+	if (compact) {
+		let normalized = new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`)
+		if (Number.isFinite(normalized.getTime())) return normalized.toISOString()
+	}
+	return ''
+}
+
+function pickPublishedAt(obj) {
+	for (let path of [
+		['dateTime'],
+		['date'],
+		['time'],
+		['publishedAt'],
+		['pubDate'],
+		['dateTimePub'],
+		['dateTimePubUtc'],
+		['article', 'dateTime'],
+		['article', 'date'],
+		['article', 'time'],
+	]) {
+		let iso = normalizePublishedAt(get(obj, path))
+		if (iso) return iso
+	}
+	return ''
 }
 
 function pickFirstMeta(document, selectors) {
@@ -214,12 +261,14 @@ async function getJson(url, params) {
 	let start = Date.now()
 	let t = setTimeout(() => controller.abort(new Error('timeout')), ms)
 	let response
+	trackApiRequest('newsapi')
 	try {
 		response = await fetch(buildUrl(url, params), {
 			headers: { accept: 'application/json' },
 			signal: controller.signal,
 		})
 		if (!response.ok) {
+			trackApiResult('newsapi', 'failed')
 			log('newsapi.ai request failed', response.status, response.statusText, `ms=${Date.now() - start}`, 'at', url)
 			// Don't keep the connection open if we aren't going to read the body.
 			try { await response?.body?.cancel?.() } catch {}
@@ -229,6 +278,7 @@ async function getJson(url, params) {
 		// error out on timeouts without leaving dangling promises behind.
 		let json = await response.json()
 		if (json?.error) {
+			trackApiResult('newsapi', 'failed')
 			let extra = []
 			if (json.statusCode) extra.push(`statusCode=${json.statusCode}`)
 			if (json.usedCustomization) extra.push(`customization=${json.usedCustomization}`)
@@ -236,13 +286,16 @@ async function getJson(url, params) {
 			log('newsapi.ai error', json.error, extra.join(' '), 'at', url)
 			return
 		}
+		trackApiResult('newsapi', 'success')
 		return json
 	} catch (e) {
 		if (controller.signal.aborted) {
+			trackApiResult('newsapi', 'timeout')
 			// Don't log full URL (it contains apiKey).
 			log('newsapi.ai request timed out after', (ms / 1e3).toFixed(), 's:', `ms=${Date.now() - start}`, 'at', url)
 			return
 		}
+		trackApiResult('newsapi', 'failed')
 		log('newsapi.ai request failed', e, `ms=${Date.now() - start}`, 'at', url)
 	} finally {
 		clearTimeout(t)
@@ -402,6 +455,7 @@ async function searchArticlesByKeywords(keywords, keywordOper = 'or') {
 			source: a?.source?.title,
 			sourceUri: a?.source?.uri,
 			eventUri: a?.eventUri,
+			publishedAt: pickPublishedAt(a),
 		}))
 		.filter(a => a.url)
 }
@@ -411,8 +465,9 @@ async function keywordFallbackCandidates(articleUrl, context, keywordsOverride) 
 		? keywordsOverride
 		: slugToKeywords(articleUrl, 20)
 	if (!keywords.length) return []
+	let mode = Array.isArray(keywordsOverride) && keywordsOverride.length ? 'provided keywords' : 'url keywords'
 
-	log(`newsapi.ai: ${context}; url keywords (${keywords.length}):`, keywords.join(' '))
+	log(`newsapi.ai: ${context}; ${mode} (${keywords.length}):`, keywords.join(' '))
 
 	log(`newsapi.ai: ${context}; keyword fallback (and):`, keywords.join(' '))
 	return await searchArticlesByKeywords(keywords, 'and')
@@ -460,6 +515,7 @@ async function getDuplicatedArticles(articleUri) {
 			title: a?.title,
 			source: a?.source?.title,
 			sourceUri: a?.source?.uri,
+			publishedAt: pickPublishedAt(a),
 		}))
 		.filter(a => a.url)
 }
@@ -491,6 +547,7 @@ async function getEventArticles(eventUri) {
 			title: a?.title,
 			source: a?.source?.title,
 			sourceUri: a?.source?.uri,
+			publishedAt: pickPublishedAt(a),
 		}))
 		.filter(a => a.url)
 }
