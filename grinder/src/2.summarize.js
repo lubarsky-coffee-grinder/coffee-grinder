@@ -281,8 +281,11 @@ async function decodeWithThrottle(last, gnUrl, label = 'Decoding URL...') {
 	return await decodeGoogleNewsUrl(gnUrl)
 }
 
-async function tryOtherAgencies(e) {
-	let keywordsAll = urlKeywords(e.url, FALLBACK_MAX_KEYWORDS)
+async function tryOtherAgencies(e, primaryUrl) {
+	let sourceUrl = normalizeHttpUrl(primaryUrl || e.url)
+	if (!sourceUrl) return
+
+	let keywordsAll = urlKeywords(sourceUrl, FALLBACK_MAX_KEYWORDS)
 	let keywords = keywordsAll.filter(k => k.length >= 4)
 	if (keywords.length < 2) keywords = keywordsAll
 	if (!keywords.length) {
@@ -292,17 +295,17 @@ async function tryOtherAgencies(e) {
 
 	log(`Fallback URL keywords (${keywords.length}):`, keywords.join(' '))
 	log('Extracting fallback keywords...', describeFallbackKeywordsSettings())
-	let aiKeywords = await extractFallbackKeywords(e.url, keywords, 8)
+	let aiKeywords = await extractFallbackKeywords(sourceUrl, keywords, 8)
 	if (aiKeywords.length) log(`Fallback AI keywords (${aiKeywords.length}):`, aiKeywords.join(' '))
 	let searchKeywords = aiKeywords.length ? aiKeywords : keywords
 	log(`Fallback search keywords (${searchKeywords.length}):`, searchKeywords.join(' '))
 
-	let candidates = await findAlternativeArticles(e.url, { keywords: searchKeywords })
+	let candidates = await findAlternativeArticles(sourceUrl, { keywords: searchKeywords })
 	if (!candidates.length) {
 		log('No alternative articles found')
 		return
 	}
-	const currentUrl = normalizeHttpUrl(e.url)
+	const currentUrl = sourceUrl
 	const alternativeUrls = uniq(
 		candidates
 			.map(a => normalizeHttpUrl(a?.url))
@@ -317,7 +320,7 @@ async function tryOtherAgencies(e) {
 	log('Found', candidates.length, 'alternative candidates')
 	let baseSource = (e.source || '').trim().toLowerCase()
 	let baseHost = ''
-	try { baseHost = new URL(e.url).hostname } catch {}
+	try { baseHost = new URL(sourceUrl).hostname } catch {}
 	let keywordsForMatch = keywords
 	if (keywordsForMatch.length) log('Fallback relevance keywords:', keywordsForMatch.join(' '))
 
@@ -328,7 +331,7 @@ async function tryOtherAgencies(e) {
 	for (let a of candidates) {
 		if (tries >= maxTries) break
 		let url = a?.url
-		if (!url || url === e.url) continue
+		if (!url || url === sourceUrl) continue
 		if (baseSource && a.source && a.source.trim().toLowerCase() === baseSource) continue
 		if (baseHost) {
 			try {
@@ -360,8 +363,6 @@ async function tryOtherAgencies(e) {
 					continue
 				}
 			}
-			e.url = url
-			if (a.source) e.source = a.source
 			return extracted
 		}
 	}
@@ -433,37 +434,38 @@ export async function summarize() {
 			e.titleEn || e.titleRu || '',
 		)
 		let articleText = ''
+		let sourceUrl = normalizeHttpUrl(e.url)
 
-		if (!e.url /*&& !restricted.includes(e.source)*/) {
+		if (!sourceUrl /*&& !restricted.includes(e.source)*/) {
 			if (!e.gnUrl) {
 				log('SKIP processing: missing url and gnUrl')
 				stats.fail++
 				continue
 			}
-			e.url = await decodeWithThrottle(last, e.gnUrl)
-			if (!e.url) {
+			sourceUrl = await decodeWithThrottle(last, e.gnUrl)
+			if (!sourceUrl) {
 				await sleep(5*60e3)
 				i--
 				continue
 			}
-			log('got', e.url)
+			log('got', sourceUrl)
 		}
-		if (e.url) {
+		if (sourceUrl) {
 			// Always keep the actually used source URL:
 			// start with original URL, then overwrite with fallback URL if selected later.
-			e.usedUrl = e.url
+			e.usedUrl = sourceUrl
 		}
 
 		const needsTextWork = !hasMeaningfulText(e.summary) || !hasMeaningfulText(e.factsRu) || !hasVideoLinks(e.videoUrls)
-		if (e.url && needsTextWork) {
-			log('Extracting', e.source || '', 'article...', e.url ? `url=${e.url}` : '')
-			let extracted = await extractVerified(e.url)
+		if (sourceUrl && needsTextWork) {
+			log('Extracting', e.source || '', 'article...', `url=${sourceUrl}`)
+			let extracted = await extractVerified(sourceUrl)
 			if (!extracted) {
 				log('Failed to extract article text, trying another agency...')
-				extracted = await tryOtherAgencies(e)
+				extracted = await tryOtherAgencies(e, sourceUrl)
 			}
 			if (extracted) {
-				e.usedUrl = extracted.url || e.url
+				e.usedUrl = extracted.url || sourceUrl
 				log('got', extracted.text.length, 'chars')
 				fs.writeFileSync(`articles/${e.id}.html`, wrapHtml(extracted))
 				articleText = extracted.text
@@ -471,7 +473,7 @@ export async function summarize() {
 			} else {
 				log('Could not extract article text. Trying URL title lookup...', describeTitleLookupSettings())
 				try {
-					let lookedUp = await collectTitleByUrl({ url: e.usedUrl || e.url })
+					let lookedUp = await collectTitleByUrl({ url: e.usedUrl || sourceUrl || e.url })
 					if (lookedUp?.titleEn || lookedUp?.titleRu) {
 						e.titleEn ||= lookedUp.titleEn
 						e.titleRu ||= lookedUp.titleRu
@@ -493,7 +495,7 @@ export async function summarize() {
 		const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && !hasVideoLinks(e.videoUrls)
 
 		if (shouldSummarize || shouldCollectFacts || shouldCollectVideos) {
-			let enrichInput = { ...e, text: articleText }
+			let enrichInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText }
 			let tasks = []
 			const makeLogger = (task) => (...params) => task.logs.push(params)
 
@@ -505,7 +507,7 @@ export async function summarize() {
 					run: async () => {
 						await sleep(last.ai.time + last.ai.delay - Date.now())
 						last.ai.time = Date.now()
-						return await ai({ url: e.url, text: articleText, logger: makeLogger(task) })
+						return await ai({ url: e.usedUrl || sourceUrl || e.url, text: articleText, logger: makeLogger(task) })
 					}
 				}
 				tasks.push(task)
