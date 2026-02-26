@@ -9,9 +9,12 @@ export default [
 - URL
 - Текст статьи
 
-Создавайте резюме, на чтение которого уйдет не менее 20 и не более 45 секунд.
 Резюме статьи должно содержать только информацию из текста статьи, игнорируйте комментарии и другие разделы.
-Встраивайте название статьи (не обязательно) и источник (обязательно) естественным образом в текст. Не упоминайте дату публикации.
+Создавайте резюме для озвучки длительностью не менее пятнадцати и не более тридцати секунд.
+Название статьи можно упомянуть в тексте (не обязательно).
+Источник обязателен и должен быть озвучен в самом конце резюме, в последней фразе.
+Финальная фраза должна явно называть агентство его полным названием, без сокращений, например: «Об этом сообщает [полное название источника].» или «По данным [полное название источника].».
+Не упоминайте дату публикации.
 Числа, даты и суммы записывайте прописью. Не указывайте ссылку на источник.
 Только название источника можно давать на английском или другом языке, все остальное должно быть по-русски.
 
@@ -103,23 +106,24 @@ Input:
 You will receive the full text of a news article (usually in English, sometimes in other languages).
 
 Task:
-Find 5–10 relevant video links that can be used as B-roll or context for this specific story.
+Find exactly one relevant video link that can be used as B-roll or context for this specific story.
 
 Strict rules:
-- Return ONLY YouTube links (\`youtube.com\` or \`youtu.be\`).
+- Return ONLY one YouTube link (\`youtube.com\` or \`youtu.be\`).
 - Do not return links from any other domains.
-- Prefer official channels and major media organizations.
+- Use only official news channels and major media organizations.
+- Completely exclude Al Jazeera channels (including Al Jazeera English/Arabic and any Al Jazeera branded channel).
 - Try to find YouTube videos related to this story from these media sources:
   Forbes Breaking News, Sky News, Reuters, New York Post, Guardian News, Firstpost, NewsX World.
 - Prioritize YouTube uploads from those outlets/channels when available.
 - Avoid low-quality reposts, clickbait, sensationalism, and duplicates.
-- No more than 2 videos from the same channel/source.
 - Do not invent links.
-- If no reliable YouTube links exist, return an empty list.
+- If no reliable non-excluded YouTube link exists, return an empty list.
 
 Formatting:
 - Output only a bullet list.
 - One URL per bullet.
+- Return either exactly one bullet or an empty list.
 - No extra text.`,
 	},
 	{

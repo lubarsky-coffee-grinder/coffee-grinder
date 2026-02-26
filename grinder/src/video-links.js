@@ -7,7 +7,7 @@ import { sleep } from './sleep.js'
 import { estimateAndLogCost, trackApiRequest, trackApiResult } from './cost.js'
 
 const MAX_CANDIDATE_PAGES = 8
-const MAX_VIDEO_URLS = 3
+const MAX_VIDEO_URLS = 1
 const MAX_VIDEOS_PER_SOURCE = 1
 const MAX_SOURCE_PAGES_TO_CHECK = 1
 const SERPAPI_TIMEOUT_MS = 12e3
@@ -151,6 +151,10 @@ const TRUSTED_DOMAIN_LIST = Object.values(VIDEO_SOURCE_DOMAINS)
 	.map(v => String(v || '').toLowerCase())
 	.filter(Boolean)
 
+const EXCLUDED_YOUTUBE_CHANNEL_PATTERNS = [
+	/\bal[\s_-]*jazeera\b/i,
+]
+
 const YOUTUBE_SOURCE_HANDLES = {
 	'Forbes Breaking News': ['ForbesBreakingNews'],
 	'Sky News': ['SkyNews'],
@@ -243,6 +247,18 @@ function resolveTrustedSourceByUrl(url) {
 
 function isTrustedSourcePage(url) {
 	return !!resolveTrustedSourceByUrl(url)
+}
+
+function isExcludedChannelText(value) {
+	let text = String(value || '').trim().toLowerCase()
+	if (!text) return false
+	return EXCLUDED_YOUTUBE_CHANNEL_PATTERNS.some(rx => rx.test(text))
+}
+
+function isExcludedVideoByChannel({ source, channelTitle, author } = {}) {
+	return isExcludedChannelText(author)
+		|| isExcludedChannelText(channelTitle)
+		|| isExcludedChannelText(source)
 }
 
 function parseDateValue(value) {
@@ -1522,6 +1538,13 @@ async function chooseRelevantYoutubeUploadVideo({ story, source, channelUrl, cha
 		}))
 		.filter(v => v.url)
 		.filter(v => !currentVideos.includes(v.url))
+		.filter(v => {
+			let excluded = isExcludedVideoByChannel({ source, channelTitle, author: v.author })
+			if (excluded) {
+				logger('VIDEOS excluded channel:', `source=${source || 'unknown'}`, `author=${v.author || 'unknown'}`, `video=${v.url}`)
+			}
+			return !excluded
+		})
 	if (!pool.length) return null
 
 	let candidateSnippet = pool
@@ -1760,15 +1783,30 @@ async function chooseRelevantVideo({ story, candidate, candidateHtml, candidateS
 	if (!found.length) return null
 
 	let attempts = found.slice(0, MAX_VERIFY_VIDEOS_PER_PAGE)
-	let videos = await Promise.all(attempts.map(async (videoUrl) => {
+	let videos = (await Promise.all(attempts.map(async (videoUrl) => {
 		let meta = await fetchYoutubeMetadata(videoUrl, logger)
+		let excluded = isExcludedVideoByChannel({
+			source: candidate?.source,
+			channelTitle: '',
+			author: meta.author,
+		})
+		if (excluded) {
+			logger(
+				'VIDEOS excluded channel:',
+				`source=${candidate?.source || 'unknown'}`,
+				`author=${meta.author || 'unknown'}`,
+				`video=${videoUrl}`,
+			)
+			return null
+		}
 		return {
 			url: videoUrl,
 			title: meta.title,
 			author: meta.author,
 			description: meta.description,
 		}
-	}))
+	}))).filter(Boolean)
+	if (!videos.length) return null
 
 	let decisions = await verifyVideoCandidatesRelevance({
 		story,
@@ -1918,7 +1956,7 @@ export function describeVideoCollectionSettings() {
 		: youtubeApiEnabledByConfig
 			? 'ytapi=off missing_oauth_credentials'
 			: 'ytapi=off config_disabled'
-	return `strategy=ytapi_then_ytrss_then_pages ${verifyLabel} ${ytLabel} ytrss=fallback date_window=+/-${DATE_WINDOW_DAYS}d fallback_if_missing=today+/-${FALLBACK_DATE_WINDOW_DAYS}d max1video_per_source yt_verify_per_source=${YOUTUBE_VERIFY_VIDEOS_PER_SOURCE} yt_verify_per_story=${YOUTUBE_VERIFY_VIDEOS_PER_STORY} trusted_sources=${TRUSTED_VIDEO_SOURCES.join(' | ')}`
+	return `strategy=ytapi_then_ytrss_then_pages ${verifyLabel} ${ytLabel} ytrss=fallback date_window=+/-${DATE_WINDOW_DAYS}d fallback_if_missing=today+/-${FALLBACK_DATE_WINDOW_DAYS}d max_video_urls=${MAX_VIDEO_URLS} max1video_per_source excluded_channels=Al_Jazeera yt_verify_per_source=${YOUTUBE_VERIFY_VIDEOS_PER_SOURCE} yt_verify_per_story=${YOUTUBE_VERIFY_VIDEOS_PER_STORY} trusted_sources=${TRUSTED_VIDEO_SOURCES.join(' | ')}`
 }
 
 export async function collectVideosFromTrustedSources(story, { logger = console.log } = {}) {

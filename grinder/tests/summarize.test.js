@@ -162,7 +162,7 @@ test('summarize pipeline (mocked)', async () => {
 		assert.ok(updated.aiTopic, `Missing aiTopic for id=${row.id}`)
 		assert.ok(updated.aiPriority, `Missing aiPriority for id=${row.id}`)
 		if (row.gnUrl) {
-			assert.ok(updated.url, `Missing decoded url for id=${row.id}`)
+			assert.ok(updated.usedUrl, `Missing usedUrl for id=${row.id}`)
 		}
 		const htmlPath = path.join(articlesDir, `${row.id}.html`)
 		const txtPath = path.join(articlesDir, `${row.id}.txt`)
