@@ -1,72 +1,27 @@
-const WEBSEARCH_WITH_TEMPERATURE_FAMILIES = [
-	// Order matters: more specific prefixes first (e.g. "gpt-4.1-mini" before "gpt-4.1").
-	'gpt-4.1-mini',
-	'gpt-4.1',
-	'gpt-5.2',
-]
+import { resolveResponsesTemperatureConfig } from './openai-model-params.js'
+import { buildResponsesWebSearchRequest } from './openai-request-templates.js'
 
-function escapeRegExp(s) {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+export function resolveWebSearchTemperatureConfig(model, temperature) {
+	return resolveResponsesTemperatureConfig(model, temperature)
 }
 
-function isSnapshotOfFamily(model, family) {
-	// Snapshots are expected to be `${family}-YYYY-MM-DD`.
-	// This intentionally does NOT treat `${family}-pro` or `${family}-nano` as a snapshot.
-	let re = new RegExp(`^${escapeRegExp(family)}-\\d{4}-\\d{2}-\\d{2}$`)
-	return re.test(model)
-}
-
-export function normalizeWebSearchWithTemperatureModel(model) {
-	if (typeof model !== 'string') return null
-	let m = model.trim()
-	if (!m) return null
-	for (let family of WEBSEARCH_WITH_TEMPERATURE_FAMILIES) {
-		if (m === family || isSnapshotOfFamily(m, family)) return family
-	}
-	return null
-}
-
-export function assertWebSearchWithTemperatureModel(model, envVarName) {
-	let family = normalizeWebSearchWithTemperatureModel(model)
-	if (family) return family
-	let where = envVarName ? ` (from ${envVarName})` : ''
-	throw new Error(
-		`Model "${model}"${where} is not allowed for web_search+temperature. ` +
-		`Allowed models: ${WEBSEARCH_WITH_TEMPERATURE_FAMILIES.join(', ')}`
-	)
-}
-
-function buildWebSearchTool(opts) {
-	let tool = { type: 'web_search' }
-	if (opts && typeof opts === 'object') {
-		if (opts.search_context_size) tool.search_context_size = opts.search_context_size
-		if (opts.user_location) tool.user_location = opts.user_location
-	}
-	return tool
-}
-
-function buildInput({ system, user }) {
-	return [
-		{ role: 'system', content: system },
-		{ role: 'user', content: user },
-	]
-}
-
-export function buildWebSearchWithTemperatureResponseBody({ model, system, user, temperature, webSearchOptions }) {
-	let family = assertWebSearchWithTemperatureModel(model)
-	let body = {
+export function buildWebSearchWithTemperatureResponseBody({
+	model,
+	system,
+	user,
+	temperature,
+	webSearchOptions,
+	reasoningEffort = 'low',
+}) {
+	let built = buildResponsesWebSearchRequest({
 		model,
-		input: buildInput({ system, user }),
-		tools: [buildWebSearchTool(webSearchOptions)],
+		system,
+		user,
 		temperature,
-	}
-
-	// GPT-5.2 supports temperature only with reasoning.effort="none".
-	if (family === 'gpt-5.2') {
-		body.reasoning = { effort: 'none' }
-	}
-
-	return body
+		webSearchOptions,
+		reasoningEffort,
+	})
+	return built.request
 }
 
 export function extractResponseOutputText(res) {

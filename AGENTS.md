@@ -1,7 +1,8 @@
 # CRITICAL RULES (HIGHEST PRIORITY)
 
-- !!! ЗАПРЕЩЕНО при любых обстоятельствах коммитить/пушить/стягивать (fetch/pull/merge/rebase/patch) любые изменения из/в репозиторий `https://github.com/lubarsky-coffee/coffee-grinder/`. Это старый репозиторий, к которому нет доступа и который НЕ является источником правды.
-- Единственный официальный source of truth: `https://github.com/korel-san/coffee-grinder`. Любые git-операции выполнять только относительно этого репозитория.
+- !!! ЗАПРЕЩЕНО при любых обстоятельствах коммитить/пушить/стягивать (fetch/pull/merge/rebase/patch) любые изменения из/в репозитории `https://github.com/lubarsky-coffee/coffee-grinder/` и `https://github.com/korel-san/coffee-grinder`. Это старые репозитории, которые НЕ являются источником правды.
+- Единственный официальный source of truth: `git@github.com:lubarsky-coffee-grinder/coffee-grinder.git` (HTTPS: `https://github.com/lubarsky-coffee-grinder/coffee-grinder`). Любые git-операции выполнять только относительно этого репозитория.
+- Использовать только remote `origin`; remote `personal` не использовать и не создавать.
 - НИКОГДА не предлагать открывать PR через ссылку. PR создавать/управлять только через GitHub CLI (`gh pr ...`).
 - НИКОГДА не делать push в `main` (запрещено). Всегда работать через отдельные ветки + PR.
 - В репозитории должен быть включен pre-push hook, который блокирует push в `main` (см. `.githooks/pre-push`). Если хуки не включены, включить через `cd grinder && npm run prepare` (или `git config core.hooksPath .githooks`).

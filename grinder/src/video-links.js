@@ -5,6 +5,7 @@ import { findAlternativeArticles } from './newsapi.js'
 import { readEnv } from './env.js'
 import { sleep } from './sleep.js'
 import { estimateAndLogCost, trackApiRequest, trackApiResult } from './cost.js'
+import { buildChatCompletionsRequest } from './openai-request-templates.js'
 
 const MAX_CANDIDATE_PAGES = 8
 const MAX_VIDEO_URLS = 1
@@ -36,15 +37,15 @@ const MIN_KEYWORD_HITS = 1
 const VERIFY_SNIPPET_MAX_CHARS = 2500
 const VERIFY_MIN_CONFIDENCE = 0.55
 const VERIFY_TEMPERATURE = 0
+const VERIFY_REASONING_EFFORT = 'medium'
 const VERIFY_VIDEO_DESCRIPTION_MAX_CHARS = 700
 const MAX_VERIFY_VIDEOS_PER_PAGE = 6
 const HOST_COOLDOWN_FAILURE_LIMIT = 2
 const HOST_COOLDOWN_STATUS_CODES = new Set([401, 403, 429])
 
-const VIDEO_VERIFY_DEFAULT_MODEL = 'gpt-4.1-mini'
-const VIDEO_VERIFY_FALLBACK_MODEL = 'gpt-4o-mini'
-const explicitVideoVerifyModel = process.env.OPENAI_VIDEO_VERIFY_MODEL
-let videoVerifyModel = explicitVideoVerifyModel || process.env.OPENAI_MODEL || VIDEO_VERIFY_DEFAULT_MODEL
+const VIDEO_VERIFY_DEFAULT_MODEL = 'gpt-4o-mini'
+const explicitVideoVerifyModel = readEnv('OPENAI_VIDEO_VERIFY_MODEL')
+const videoVerifyModel = explicitVideoVerifyModel || VIDEO_VERIFY_DEFAULT_MODEL
 const videoVerifyEnabled = process.env.VIDEO_GPT_VERIFY !== '0' && !!process.env.OPENAI_API_KEY
 const openai = videoVerifyEnabled ? new OpenAI() : null
 let serpapiCooldownUntilMs = 0
@@ -661,10 +662,6 @@ async function fetchCandidatePage(url) {
 	return { ok: false, status: 0, statusText: '', error: 'fetch_error' }
 }
 
-function isModelNotFound(e) {
-	return e?.code === 'model_not_found' || e?.status === 404
-}
-
 function isTransientApiError(e) {
 	let status = Number(e?.status || e?.statusCode || e?.response?.status)
 	if (status === 429) return true
@@ -755,79 +752,66 @@ async function verifyVideoCandidatesRelevance({ story, candidate, candidateSnipp
 		},
 	}
 
-	let retriedTransient = false
-	for (;;) {
-		try {
-			let res = await openai.chat.completions.create({
-				model: videoVerifyModel,
-				temperature: VERIFY_TEMPERATURE,
-				response_format: VIDEO_VERIFY_RESPONSE_FORMAT,
-				messages: [
-					{
-						role: 'system',
-						content: [
-							'You verify whether each linked YouTube video in candidate article is about the same event as the original story.',
-							'Allow wording differences and different editorial framing.',
-							'Set match=false for related but different events.',
-							'Return one decision per videoUrl.',
-							'Return JSON only.',
-						].join(' '),
-					},
-					{
-						role: 'user',
-						content: JSON.stringify(payload),
-					},
-				],
-			})
+	try {
+		let built = buildChatCompletionsRequest({
+			model: videoVerifyModel,
+			temperature: VERIFY_TEMPERATURE,
+			reasoningEffort: VERIFY_REASONING_EFFORT,
+			responseFormat: VIDEO_VERIFY_RESPONSE_FORMAT,
+			messages: [
+				{
+					role: 'system',
+					content: [
+						'You verify whether each linked YouTube video in candidate article is about the same event as the original story.',
+						'Allow wording differences and different editorial framing.',
+						'Set match=false for related but different events.',
+						'Return one decision per videoUrl.',
+						'Return JSON only.',
+					].join(' '),
+				},
+				{
+					role: 'user',
+					content: JSON.stringify(payload),
+				},
+			],
+		})
 
-			estimateAndLogCost({
-				task: 'video_verify_batch',
-				model: videoVerifyModel,
-				usage: res?.usage,
-				logger,
-			})
+		let res = await openai.chat.completions.create(built.request)
 
-			let content = res?.choices?.[0]?.message?.content
-			if (!content) {
-				let out = new Map()
-				for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_empty' })
-				return out
-			}
+		estimateAndLogCost({
+			task: 'video_verify_batch',
+			model: videoVerifyModel,
+			usage: res?.usage,
+			logger,
+		})
 
-			let parsed
-			try {
-				parsed = JSON.parse(content)
-			} catch {
-				let out = new Map()
-				for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_json_parse_failed' })
-				return out
-			}
-
-			let out = parseBatchVerifyDecisions(parsed, validUrls)
-			for (let v of normalizedVideos) {
-				if (out.has(v.url)) continue
-				out.set(v.url, { match: false, confidence: 0, reason: 'verify_missing' })
-			}
-			return out
-		} catch (e) {
-			if (isModelNotFound(e) && !explicitVideoVerifyModel && videoVerifyModel !== VIDEO_VERIFY_FALLBACK_MODEL) {
-				logger('VIDEOS_VERIFY model not found:', videoVerifyModel, 'falling back to:', VIDEO_VERIFY_FALLBACK_MODEL)
-				videoVerifyModel = VIDEO_VERIFY_FALLBACK_MODEL
-				continue
-			}
-
-			if (isTransientApiError(e) && !retriedTransient) {
-				retriedTransient = true
-				logger('VIDEOS_VERIFY transient error, retrying once\n', e)
-				await sleep(1500)
-				continue
-			}
-
-			logger('VIDEOS_VERIFY failed\n', e)
+		let content = res?.choices?.[0]?.message?.content
+		if (!content) {
 			let out = new Map()
-			for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_error' })
+			for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_empty' })
 			return out
 		}
+
+		let parsed
+		try {
+			parsed = JSON.parse(content)
+		} catch {
+			let out = new Map()
+			for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_json_parse_failed' })
+			return out
+		}
+
+		let out = parseBatchVerifyDecisions(parsed, validUrls)
+		for (let v of normalizedVideos) {
+			if (out.has(v.url)) continue
+			out.set(v.url, { match: false, confidence: 0, reason: 'verify_missing' })
+		}
+		return out
+	} catch (e) {
+		logger('VIDEOS_VERIFY failed\n', e)
+		let out = new Map()
+		for (let v of normalizedVideos) out.set(v.url, { match: false, confidence: 0, reason: 'verify_error' })
+		return out
 	}
 }
 
@@ -1949,7 +1933,7 @@ async function collectVideosFromTrustedPages({
 
 export function describeVideoCollectionSettings() {
 	let verifyLabel = videoVerifyEnabled
-		? `verify=gpt model=${videoVerifyModel} min_conf=${VERIFY_MIN_CONFIDENCE}`
+		? `verify=gpt model=${videoVerifyModel} reasoning=${VERIFY_REASONING_EFFORT} min_conf=${VERIFY_MIN_CONFIDENCE}`
 		: 'verify=off'
 	let ytLabel = youtubeOauthClient
 		? `ytapi=primary auth=oauth uploads_per_source=${YOUTUBE_UPLOADS_PER_SOURCE}`

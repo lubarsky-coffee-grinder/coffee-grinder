@@ -4,6 +4,7 @@ export let rootFolderId = readEnv('GOOGLE_ROOT_FOLDER_ID')
 export let mainSpreadsheetId = readEnv('GOOGLE_SHEET_ID_MAIN')
 export let autoSpreadsheetId = readEnv('GOOGLE_SHEET_ID_AUTO')
 export let newsSheet = 'news'
+export let screenshotLogsSheet = 'screenshot_logs'
 export let aiSheet = 'ai-instructions'
 export let promptsSheet = 'prompts'
 export let templatePresentationId = readEnv('GOOGLE_TEMPLATE_PRESENTATION_ID')

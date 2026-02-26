@@ -11,6 +11,7 @@ import { ai } from './ai.js'
 import { collectFacts, collectVideos, collectTitleByUrl, describeFactsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
 import { extractFallbackKeywords, describeFallbackKeywordsSettings } from './fallback-keywords.js'
 import { logRunApiStats, logRunTotalCost } from './cost.js'
+import { ensureSummaryAttribution } from './summary-attribution.js'
 
 const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
@@ -256,6 +257,39 @@ function processingDecision(e) {
 	}
 }
 
+function collectDuplicateUrlGroups(rows) {
+	let grouped = new Map()
+	for (let e of rows || []) {
+		let key = normalizeHttpUrl(e.usedUrl || e.url)
+		if (!key) continue
+		let bucket = grouped.get(key)
+		if (!bucket) {
+			bucket = []
+			grouped.set(key, bucket)
+		}
+		bucket.push(e)
+	}
+	return [...grouped.entries()]
+		.filter(([, group]) => group.length > 1)
+		.map(([url, group], idx) => ({ groupId: idx + 1, url, group }))
+}
+
+function markDuplicateUrls(rows) {
+	for (let e of rows || []) {
+		e.duplicateUrl = ''
+	}
+
+	let groups = collectDuplicateUrlGroups(rows)
+	for (let g of groups) {
+		let peerIds = uniq(g.group.map(e => String(e.id || '').trim()).filter(Boolean))
+		let mark = `DUP_URL group=${g.groupId}; count=${g.group.length}; peer_ids=${peerIds.join(',')}; key=${g.url}`
+		for (let e of g.group) {
+			e.duplicateUrl = mark
+		}
+	}
+	return groups
+}
+
 async function extractVerified(url) {
 	for (let attempt = 0; attempt < 2; attempt++) {
 		log(`Extract attempt ${attempt + 1}/2...`)
@@ -369,7 +403,7 @@ async function tryOtherAgencies(e, primaryUrl) {
 }
 
 export async function summarize() {
-	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'videoUrls'])
+	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'videoUrls', 'duplicateUrl'])
 
 	news.forEach((e, i) => e.id ||= i + 1)
 
@@ -499,21 +533,26 @@ export async function summarize() {
 			let tasks = []
 			const makeLogger = (task) => (...params) => task.logs.push(params)
 
-			if (shouldSummarize) {
-				log('Summarizing', articleText.length, 'chars...')
-				let task = {
-					name: 'summary',
-					logs: [],
-					run: async () => {
-						await sleep(last.ai.time + last.ai.delay - Date.now())
-						last.ai.time = Date.now()
-						return await ai({ url: e.usedUrl || sourceUrl || e.url, text: articleText, logger: makeLogger(task) })
+				if (shouldSummarize) {
+					log('Summarizing', articleText.length, 'chars...')
+					let task = {
+						name: 'summary',
+						logs: [],
+						run: async () => {
+							await sleep(last.ai.time + last.ai.delay - Date.now())
+							last.ai.time = Date.now()
+							return await ai({
+								url: e.usedUrl || sourceUrl || e.url,
+								source: e.source,
+								text: articleText,
+								logger: makeLogger(task),
+							})
+						}
 					}
+					tasks.push(task)
 				}
-				tasks.push(task)
-			}
 
-			if (shouldCollectFacts) {
+				if (shouldCollectFacts) {
 				log('Collecting facts...', describeFactsSettings())
 				let task = {
 					name: 'facts',
@@ -564,12 +603,16 @@ export async function summarize() {
 					if (res) {
 						last.ai.delay = res.delay
 						const normalizedTopic = normalizeTopic(topicsMap[res.topic] || res.topic || '')
+						let normalizedSummary = ensureSummaryAttribution(res.summary, e)
 						e.priority ||= res.priority
 						e.titleRu ||= res.titleRu
-						e.summary = res.summary
+						e.summary = normalizedSummary
 						e.aiTopic = normalizedTopic || topicsMap[res.topic]
 						e.aiPriority = res.priority
-						log('summary done', `${String(res.summary || '').length} chars`)
+						if (normalizedSummary !== String(res.summary ?? '').trim()) {
+							log('summary attribution appended')
+						}
+						log('summary done', `${String(normalizedSummary || '').length} chars`)
 					} else {
 						log('summary failed (empty result)')
 					}
@@ -604,6 +647,33 @@ export async function summarize() {
 			stats.fail++
 		} else {
 			stats.ok++
+		}
+	}
+	let attributionAutofixCount = 0
+	for (let e of news) {
+		let fixedSummary = ensureSummaryAttribution(e.summary, e)
+		if (!fixedSummary || fixedSummary === String(e.summary ?? '').trim()) continue
+		e.summary = fixedSummary
+		attributionAutofixCount++
+	}
+	if (attributionAutofixCount) {
+		log('SUMMARY_ATTRIBUTION_AUTOFIX', `updated=${attributionAutofixCount}`)
+	}
+	let duplicateGroups = markDuplicateUrls(news)
+	let duplicateRows = duplicateGroups.reduce((sum, g) => sum + g.group.length, 0)
+	log('SUMMARY_DUP_URL', `groups=${duplicateGroups.length}`, `rows=${duplicateRows}`)
+	for (let g of duplicateGroups) {
+		log(`SUMMARY_DUP_URL group=${g.groupId} count=${g.group.length} url=${g.url}`)
+		for (let e of g.group) {
+			log(
+				'  row',
+				`id=${e.id || ''}`,
+				`sqk=${e.sqk || ''}`,
+				`source=${e.source || ''}`,
+				`title=${e.titleRu || e.titleEn || ''}`,
+				`url=${normalizeHttpUrl(e.url) || String(e.url || '').trim()}`,
+				`usedUrl=${normalizeHttpUrl(e.usedUrl) || String(e.usedUrl || '').trim()}`,
+			)
 		}
 	}
 	let order = e => (+e.sqk || 999) * 1000 + (topics[e.topic]?.id ?? 99) * 10 + (+e.priority || 10)

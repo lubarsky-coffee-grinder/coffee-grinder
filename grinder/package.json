@@ -27,6 +27,7 @@
     "node": ">=24 <25"
   },
   "dependencies": {
+    "@brightdata/sdk": "^0.2.0",
     "@googleapis/drive": "^8.14.0",
     "@googleapis/sheets": "^9.3.1",
     "@googleapis/slides": "^1.2.0",

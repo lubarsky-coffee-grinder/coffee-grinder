@@ -16,3 +16,4 @@ CLAUDE.md
 .mcp.json
 **/*.jpg
 nul
+/grinder/logs/
