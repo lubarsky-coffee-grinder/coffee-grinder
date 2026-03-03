@@ -1,5 +1,5 @@
 import { firefox } from 'playwright'
-import { readFile, stat, unlink } from 'fs/promises'
+import { readFile, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import OpenAI from 'openai'
 import { log } from './log.js'
@@ -45,14 +45,17 @@ const HEALTH_POLICIES = {
 const SAFE_CLICK_TEXTS = [
 	'accept all',
 	'i accept all',
+	'i accept',
 	'accept all cookies',
 	'allow all cookies',
 	'accept',
+	'consent',
 	'reject all',
 	'reject all cookies',
 	'reject non-essential',
 	'reject nonessential',
 	'reject',
+	'do not consent',
 	'decline',
 	'necessary only',
 	'use necessary cookies only',
@@ -78,6 +81,14 @@ const SAFE_CLICK_TEXTS = [
 	'согласен',
 	'соглашаюсь',
 	'согласиться',
+	'прийняти',
+	'прийняти все',
+	'прийняти всі',
+	'відхилити',
+	'відхилити все',
+	'відхилити всі',
+	'погоджуюсь',
+	'погодитися',
 	'akzeptieren',
 	'alle akzeptieren',
 	'ablehnen',
@@ -444,13 +455,13 @@ async function alignToContent(page) {
 		const h1 = document.querySelector('h1')
 		if (h1) {
 			h1.scrollIntoView({ block: 'start' })
-			window.scrollBy(0, -20)
+			window.scrollBy(0, -140)
 			return
 		}
 		const anchor = document.querySelector('article, main')
 		if (anchor) {
 			anchor.scrollIntoView({ block: 'start' })
-			window.scrollBy(0, -20)
+			window.scrollBy(0, -140)
 		}
 	})
 }
@@ -500,26 +511,61 @@ async function inspectPage(page, policy = HEALTH_POLICIES.direct) {
 				return parts.length >= 2 ? parts[parts.length - 2] : parts[0]
 			}
 
-			const headlineEl = document.querySelector('h1')
-			const headline = (headlineEl?.innerText || '').trim()
+			const titleText = String(document.title || '').trim()
+			const ogTitle = String(
+				document.querySelector('meta[property="og:title"]')?.getAttribute('content')
+				|| document.querySelector('meta[name="twitter:title"]')?.getAttribute('content')
+				|| ''
+			).trim()
+			let headlineEl = document.querySelector('h1')
+			let headline = (headlineEl?.innerText || '').trim()
+			if (!headline || headline.length < 14) {
+				const fallbackHeadlineSelectors = [
+					'[itemprop="headline"]',
+					'[class*="headline"]',
+					'[class*="article-title"]',
+					'[class*="story-title"]',
+					'article h2',
+					'main h2',
+					'h2',
+				]
+				for (const sel of fallbackHeadlineSelectors) {
+					if (headline && headline.length >= 14) break
+					const nodes = document.querySelectorAll(sel)
+					for (const node of nodes) {
+						const r = node.getBoundingClientRect()
+						if (r.width <= 0 || r.height <= 0) continue
+						const text = String(node.textContent || '').replace(/\s+/g, ' ').trim()
+						if (text.length < 14 || text.length > 260) continue
+						headlineEl = node
+						headline = text
+						break
+					}
+				}
+			}
+			if (!headline || headline.length < 14) {
+				headline = (ogTitle || titleText || '').trim()
+			}
 			const articleText = (document.querySelector('article')?.innerText || document.querySelector('main')?.innerText || '').trim()
 			const bodyText = (document.body.innerText || '').trim()
 			const scanText = `${headline}\n${bodyText}`.toLowerCase().slice(0, 40000)
-			const titleText = String(document.title || '').trim()
 
-			const hasCaptchaSignal = /(captcha|verify you are human|not a robot|security check|access denied|access_denied|unusual traffic|security verification|forbidden|request blocked|attention required|cloudflare|just a moment|bot detection)/i.test(scanText)
-			const hasPaywallText = /(subscribe|subscriber|for subscribers|sign in to continue|login to continue|paywall)/i.test(scanText)
-			const hasConsentText = /(cookie|consent|privacy settings|we care about your privacy|gdpr|partner)/i.test(scanText)
-			const hasSkeletonSignals = /skeleton|shimmer|placeholder|loading/i.test(scanText)
-			const hasPrimaryContent =
-				((headline.length > 20) && (articleText.length > 80 || bodyText.length > 800))
-				|| articleText.length > 500
-				|| bodyText.length > 2200
-			const overlayMinArea = Number(healthPolicy?.overlayMinArea || 0.16)
-			const contentAwareOverlayMinArea = Number(healthPolicy?.contentAwareOverlayMinArea || 0.28)
-			const consentHintRegex = /(cookie|consent|privacy|gdpr|partner|accept|agree|reject|decline|manage preferences|your choices|we value your privacy)/
-			const paywallHintRegex = /(subscribe|subscriber|sign in|signin|log in|login|paywall|membership|unlock|trial|continue reading)/
-			const overlayHintRegex = /(cookie|consent|privacy|gdpr|subscribe|sign in|signin|login|paywall|overlay|modal|dismiss|close|accept|reject|popup|dialog|interstitial|newsletter)/
+				const hasCaptchaSignal = /(captcha|verify you are human|not a robot|security check|access denied|access_denied|unusual traffic|security verification|forbidden|request blocked|attention required|cloudflare|just a moment|bot detection)/i.test(scanText)
+				const hasStrictCaptchaSignal = /(verify you are human|not a robot|performing security verification|attention required|cloudflare|just a moment)/i.test(scanText)
+				const hasPaywallText = /(subscribe|subscriber|for subscribers|sign in to continue|login to continue|paywall)/i.test(scanText)
+				const hasConsentText = /(cookie|consent|privacy settings|we care about your privacy|gdpr|partner)/i.test(scanText)
+				const hasSkeletonSignals = /skeleton|shimmer|placeholder|loading/i.test(scanText)
+				const hasPrimaryContent =
+					((headline.length > 20) && (articleText.length > 80 || bodyText.length > 800))
+					|| articleText.length > 500
+					|| bodyText.length > 2200
+				const overlayMinArea = Number(healthPolicy?.overlayMinArea || 0.16)
+				const contentAwareOverlayMinArea = Number(healthPolicy?.contentAwareOverlayMinArea || 0.28)
+				const consentHintRegex = /(cookie|consent|privacy|gdpr|partner|accept|agree|reject|decline|manage preferences|your choices|we value your privacy)/
+				const paywallHintRegex = /(subscribe|subscriber|sign in|signin|log in|login|paywall|membership|unlock|trial|continue reading)/
+				const overlayHintRegex = /(cookie|consent|privacy|gdpr|subscribe|sign in|signin|login|paywall|overlay|modal|dismiss|close|accept|reject|popup|dialog|interstitial|newsletter)/
+				const dateVisibleRegex = /\b(?:\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4}|\d{4}[\/\.-]\d{1,2}[\/\.-]\d{1,2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)\b/i
+				const bylineHintRegex = /\b(by|author|editor|редактор|автор|журналіст|reuters|associated press|ap news|afp)\b/i
 
 			const vw = Math.max(window.innerWidth || 0, 1)
 			const vh = Math.max(window.innerHeight || 0, 1)
@@ -534,6 +580,15 @@ async function inspectPage(page, policy = HEALTH_POLICIES.direct) {
 					const st = getComputedStyle(headlineEl)
 					hasHeadlineVisible = headline.length >= 14 && st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0'
 					headlineRect = r
+				}
+			}
+			if (!hasHeadlineVisible && headline.length >= 14) {
+				const normalizedHeadline = normalize(headline)
+				const titleNorm = normalize(titleText)
+				const bodyNorm = normalize(bodyText).slice(0, 24000)
+				const needle = normalizedHeadline.slice(0, Math.min(52, normalizedHeadline.length))
+				if (needle && (titleNorm.includes(needle) || bodyNorm.includes(needle))) {
+					hasHeadlineVisible = true
 				}
 			}
 			let hasBlockingOverlay = false
@@ -718,59 +773,191 @@ async function inspectPage(page, policy = HEALTH_POLICIES.direct) {
 				if (!token) return false
 				return new RegExp(`\\b${token}\\b`, 'i').test(viewportTextNorm) || new RegExp(`\\b${token}\\b`, 'i').test(titleTextNorm)
 			}
-			const hasSourceVisible = [...sourceCandidates].some(token => {
+			const hasSourceTextVisible = [...sourceCandidates].some(token => {
 				if (token.length <= 3) {
-					return hasWordToken(token) || squashedAttrText.includes(token)
+					return hasWordToken(token)
 				}
-				return squashedViewportText.includes(token) || squashedTitleText.includes(token) || squashedAttrText.includes(token)
+				return squashedViewportText.includes(token) || squashedTitleText.includes(token)
 			})
+			let hasLogoVisible = false
+			document.querySelectorAll('header img, [role="banner"] img, [class*="logo"], [id*="logo"], header svg, [role="banner"] svg, a img').forEach(node => {
+				if (hasLogoVisible) return
+				const r = node.getBoundingClientRect()
+				if (!intersectsViewport(r, vw, vh)) return
+				if (r.top > vh * 0.32 || r.left > vw * 0.5) return
+				if (r.width < 34 || r.width > vw * 0.38) return
+				if (r.height < 10 || r.height > vh * 0.22) return
+				const nodeText = normalize([
+					node.textContent || '',
+					node.getAttribute?.('alt') || '',
+					node.getAttribute?.('aria-label') || '',
+					node.getAttribute?.('title') || '',
+					node.id || '',
+					typeof node.className === 'string' ? node.className : '',
+					node.getAttribute?.('src') || '',
+					node.getAttribute?.('href') || '',
+				].join(' '))
+				const parent = node.closest?.('a,header,[role="banner"]')
+				const parentText = normalize([
+					parent?.textContent || '',
+					parent?.getAttribute?.('aria-label') || '',
+					parent?.getAttribute?.('title') || '',
+					parent?.id || '',
+					typeof parent?.className === 'string' ? parent.className : '',
+					parent?.getAttribute?.('href') || '',
+				].join(' '))
+				const scan = `${nodeText} ${parentText}`
+				const hintedLogo = /(logo|brand|masthead|site[-_ ]?name|header[-_ ]?logo|leftlogo|home)/i.test(scan)
+				const hasSourceToken = [...sourceCandidates].some(token => token && scan.includes(token))
+				if (hintedLogo || hasSourceToken) {
+					hasLogoVisible = true
+				}
+			})
+			const hasSourceVisible = hasSourceTextVisible || hasLogoVisible
 
-			const hasCaptcha = hasCaptchaSignal && (!hasHeadlineVisible || overlayCoversHeadline || !hasSourceVisible)
+				const collectVisibleTextBySelectors = (selectors, options = {}) => {
+					const maxNodes = Number(options.maxNodes || 40)
+					const maxTopRatio = Number(options.maxTopRatio || 1)
+					const minWidthRatio = Number(options.minWidthRatio || 0)
+					let out = ''
+					let count = 0
+					for (const sel of selectors) {
+						const nodes = document.querySelectorAll(sel)
+						for (const node of nodes) {
+							if (count >= maxNodes) break
+							const r = node.getBoundingClientRect()
+							if (!intersectsViewport(r, vw, vh)) continue
+							if (r.top > vh * maxTopRatio) continue
+							if (r.width < vw * minWidthRatio) continue
+							const text = normalize(node.textContent || '')
+							if (!text || text.length < 3) continue
+							out += ` ${text}`
+							count++
+						}
+					}
+					return normalize(out).slice(0, 4000)
+				}
 
-			let issueType = 'none'
-			if (hasCaptcha) issueType = 'captcha'
-			else if (overlayCoversHeadline && consentHintRegex.test(overlayText)) issueType = 'consent'
-			else if (overlayCoversHeadline && paywallHintRegex.test(overlayText)) issueType = 'paywall'
-			else if (overlayCoversHeadline) issueType = 'overlay'
-			else if (!hasHeadlineVisible) issueType = 'unknown'
-			else if (!hasSourceVisible) issueType = 'source'
-			else if (hasPaywallText && !hasHeadlineVisible) issueType = 'paywall'
-			else if (!hasPrimaryContent) issueType = 'unknown'
+				const subtitleText = collectVisibleTextBySelectors([
+					'[class*="subheadline"]',
+					'[class*="subtitle"]',
+					'[class*="standfirst"]',
+					'[class*="dek"]',
+					'[itemprop="description"]',
+					'article h2',
+					'main h2',
+					'h2',
+				], { maxNodes: 30, maxTopRatio: 0.75, minWidthRatio: 0.18 })
+				const hasSubtitleVisible =
+					subtitleText.length >= 28
+					&& normalize(subtitleText) !== normalize(headline)
+					&& !consentHintRegex.test(subtitleText)
 
-			const ok = hasHeadlineVisible && hasSourceVisible && !overlayCoversHeadline && !hasCaptcha
-			if (ok) issueType = 'none'
+				const dateText = collectVisibleTextBySelectors([
+					'time',
+					'[datetime]',
+					'[itemprop*="date"]',
+					'[class*="date"]',
+					'[class*="time"]',
+					'[class*="updated"]',
+					'[class*="published"]',
+					'[data-testid*="date"]',
+					'[data-test*="date"]',
+				], { maxNodes: 60, maxTopRatio: 0.9, minWidthRatio: 0.06 })
+				const hasDateVisible = dateVisibleRegex.test(dateText)
+
+				const bylineText = collectVisibleTextBySelectors([
+					'[itemprop="author"]',
+					'[rel="author"]',
+					'[class*="author"]',
+					'[class*="byline"]',
+				], { maxNodes: 24, maxTopRatio: 0.85, minWidthRatio: 0.06 })
+				const hasBylineVisible = bylineHintRegex.test(bylineText) && !consentHintRegex.test(bylineText)
+
+				let hasImageVisible = false
+				document.querySelectorAll('article img, main img, figure img, picture img, img, video').forEach(node => {
+					if (hasImageVisible) return
+					const r = node.getBoundingClientRect()
+					if (!intersectsViewport(r, vw, vh)) return
+					if (r.top > vh * 0.92) return
+					if (r.width < vw * 0.22 || r.height < vh * 0.16) return
+					const alt = normalize(node.getAttribute?.('alt') || '')
+					if (alt && /(logo|icon|avatar|favicon|sprite)/i.test(alt) && r.width < vw * 0.34) return
+					hasImageVisible = true
+				})
+
+				let visibleParagraphChars = 0
+				document.querySelectorAll('article p, main p, p').forEach(node => {
+					if (visibleParagraphChars >= 420) return
+					const r = node.getBoundingClientRect()
+					if (!intersectsViewport(r, vw, vh)) return
+					if (r.top > vh * 0.95) return
+					if (r.width < vw * 0.28) return
+					const text = normalize(node.textContent || '')
+					if (text.length < 45) return
+					if (consentHintRegex.test(text)) return
+					visibleParagraphChars += text.length
+				})
+				const hasLeadTextVisible = visibleParagraphChars >= 140 || articleText.length >= 220
+
+				const hasCaptcha = hasStrictCaptchaSignal || (hasCaptchaSignal && !hasPrimaryContent)
+
+				let issueType = 'none'
+				if (hasCaptcha) issueType = 'captcha'
+				else if (hasBlockingOverlay && consentHintRegex.test(overlayText)) issueType = 'consent'
+				else if (hasBlockingOverlay && paywallHintRegex.test(overlayText)) issueType = 'paywall'
+				else if (hasBlockingOverlay) issueType = 'overlay'
+				else if (!hasHeadlineVisible) issueType = 'unknown'
+				else if (!hasSourceVisible) issueType = 'source'
+				else if (hasPaywallText && !hasHeadlineVisible) issueType = 'paywall'
+				else if (!hasPrimaryContent) issueType = 'unknown'
+
+				const ok = hasHeadlineVisible && hasSourceVisible && !hasBlockingOverlay && !hasCaptcha
+				if (ok) issueType = 'none'
 			let reason = ok ? 'source_visible' : issueType
 			if (!ok && hasConsentText && issueType === 'unknown') reason = 'consent_like_unknown'
 			if (ok && hasSkeletonSignals) reason = 'source_visible_skeleton'
 			if (ok && paywallHintRegex.test(normalize(overlayText)) && hasPaywallText) reason = 'source_visible_paywall'
 
-			return {
-				ok,
-				issueType,
-				reason,
-				hasBlockingOverlay,
-				hasPrimaryContent,
-				hasSkeletonSignals,
-				hasHeadlineVisible,
-				hasSourceVisible,
-				overlayCoversHeadline,
-				host,
-				titleText: normalize(titleText).slice(0, 220),
-			}
-		}, policy)
+				return {
+					ok,
+					issueType,
+					reason,
+					hasBlockingOverlay,
+					hasPrimaryContent,
+					hasSkeletonSignals,
+					hasHeadlineVisible,
+					hasSourceVisible,
+					hasSubtitleVisible,
+					hasDateVisible,
+					hasBylineVisible,
+					hasImageVisible,
+					hasLeadTextVisible,
+					hasPaywallText,
+					overlayCoversHeadline,
+					host,
+					titleText: normalize(titleText).slice(0, 220),
+				}
+			}, policy)
 	} catch (e) {
 		return {
 			ok: false,
 			issueType: 'unknown',
 			reason: `inspect_error: ${String(e?.message || e)}`,
-			hasBlockingOverlay: false,
-			hasPrimaryContent: false,
-			hasHeadlineVisible: false,
-			hasSourceVisible: false,
-			overlayCoversHeadline: false,
+				hasBlockingOverlay: false,
+				hasPrimaryContent: false,
+				hasHeadlineVisible: false,
+				hasSourceVisible: false,
+				hasSubtitleVisible: false,
+				hasDateVisible: false,
+				hasBylineVisible: false,
+				hasImageVisible: false,
+				hasLeadTextVisible: false,
+				hasPaywallText: false,
+				overlayCoversHeadline: false,
+			}
 		}
 	}
-}
 
 function extractJson(text) {
 	if (!text) return null
@@ -797,6 +984,35 @@ function shouldUseVisionFallback(check) {
 	return check?.reason === 'consent_like_unknown'
 }
 
+function assessFinalFrameQuality(check) {
+	const hasPaywallContext =
+		!!check?.hasPaywallText
+		|| String(check?.issueType || '').toLowerCase() === 'paywall'
+		|| String(check?.reason || '').toLowerCase().includes('paywall')
+	const hasSource = !!check?.hasSourceVisible
+	const hasHeadline = !!check?.hasHeadlineVisible
+	const hasDateOrByline = !!check?.hasDateVisible || !!check?.hasBylineVisible || hasPaywallContext
+	const hasLeadText = !!check?.hasLeadTextVisible || !!check?.hasPrimaryContent || hasPaywallContext
+	const hasSupportVisual = !!check?.hasSubtitleVisible || !!check?.hasImageVisible || hasPaywallContext
+	const hasBlocking = !!check?.hasBlockingOverlay || !!check?.overlayCoversHeadline
+
+	const missing = []
+	if (!hasSource) missing.push('source')
+	if (!hasHeadline) missing.push('headline')
+	if (!hasLeadText) missing.push('text')
+	if (hasBlocking) missing.push('overlay')
+
+	const warnings = []
+	if (!hasDateOrByline) warnings.push('date_or_byline_missing')
+	if (!hasSupportVisual) warnings.push('subtitle_or_image_missing')
+
+	return {
+		ok: missing.length === 0,
+		reason: missing.length ? `missing_${missing.join('_')}` : 'quality_ok',
+		warnings,
+	}
+}
+
 function shouldUseBrightDataFallback(check) {
 	return !check?.ok
 }
@@ -809,14 +1025,22 @@ function escapeHtmlAttr(value) {
 		.replaceAll('>', '&gt;')
 }
 
-function buildUnlockedHtml(url, html) {
+function buildUnlockedHtml(url, html, options = {}) {
 	let raw = String(html || '').trim()
+	const stripScripts = options?.stripScripts !== false
+	const stripIframes = options?.stripIframes !== false
 	raw = raw
-		.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-		.replace(/<script\b[^>]*\/>/gi, '')
-		.replace(/<iframe\b[\s\S]*?<\/iframe>/gi, '')
-		.replace(/<iframe\b[^>]*\/>/gi, '')
 		.replace(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, '')
+	if (stripScripts) {
+		raw = raw
+			.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+			.replace(/<script\b[^>]*\/>/gi, '')
+	}
+	if (stripIframes) {
+		raw = raw
+			.replace(/<iframe\b[\s\S]*?<\/iframe>/gi, '')
+			.replace(/<iframe\b[^>]*\/>/gi, '')
+	}
 	if (!raw) return ''
 	const base = `<base href="${escapeHtmlAttr(url)}">`
 	const helperCss = `<style>html,body{overflow:auto!important}</style>`
@@ -938,6 +1162,35 @@ async function applyBrightDataFallback(page, { url, check, startedAt }) {
 			await page.waitForTimeout(500)
 			next = await inspectPage(page, HEALTH_POLICIES.unlocked)
 			log(`  health after brightdata force-clean: ok=${next.ok ? 'yes' : 'no'} issue=${next.issueType} reason=${next.reason}`)
+		}
+	}
+
+	if (!next.ok && (next.issueType === 'unknown' || next.reason === 'consent_like_unknown')) {
+		const relaxedHtml = buildUnlockedHtml(url, unlocked.html, { stripScripts: false, stripIframes: false })
+		if (relaxedHtml && relaxedHtml !== html) {
+			log('  brightdata: retry with scripts-preserved html...')
+			assertBudget(startedAt, 'brightdata_set_content_relaxed')
+			await page.setContent(relaxedHtml, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS })
+			await page.waitForTimeout(1800)
+			await waitDom(page, 7000)
+			next = await inspectPage(page, HEALTH_POLICIES.unlocked)
+			log(`  health after brightdata relaxed load: ok=${next.ok ? 'yes' : 'no'} issue=${next.issueType} reason=${next.reason}`)
+			if (!next.ok) {
+				const actions = await applyKnownFixes(page, startedAt)
+				if (actions > 0) {
+					next = await inspectPage(page, HEALTH_POLICIES.unlocked)
+					log(`  health after brightdata relaxed known-fix: ok=${next.ok ? 'yes' : 'no'} issue=${next.issueType} reason=${next.reason}`)
+				}
+			}
+			if (!next.ok) {
+				const removed = await forceRemoveBlockingLayers(page)
+				if (removed > 0) {
+					await waitDom(page, 5000)
+					await page.waitForTimeout(500)
+					next = await inspectPage(page, HEALTH_POLICIES.unlocked)
+					log(`  health after brightdata relaxed force-clean: ok=${next.ok ? 'yes' : 'no'} issue=${next.issueType} reason=${next.reason}`)
+				}
+			}
 		}
 	}
 
@@ -1161,6 +1414,16 @@ async function captureOne(context, { index, url }) {
 			if (!actions) break
 		}
 
+		if (!check.ok && (check.issueType === 'consent' || check.issueType === 'overlay' || check.reason === 'consent_like_unknown')) {
+			const removed = await forceRemoveBlockingLayers(page)
+			if (removed > 0) {
+				await waitDom(page, 5000)
+				await page.waitForTimeout(500)
+				check = await inspectPage(page, HEALTH_POLICIES.direct)
+				log(`  health after force-clean: ok=${check.ok ? 'yes' : 'no'} issue=${check.issueType} reason=${check.reason}`)
+			}
+		}
+
 		if (!check.ok && shouldUseVisionFallback(check)) {
 			log('  unresolved, asking GPT vision...')
 			try {
@@ -1221,6 +1484,25 @@ async function captureOne(context, { index, url }) {
 			throw new Error(`health_check_failed issue=${check.issueType} reason=${check.reason}`)
 		}
 
+		const filePath = join(IMG_DIR, `${index}.jpg`)
+		let preCleanupImage = null
+		try {
+			assertBudget(startedAt, 'pre_cleanup_capture')
+			preCleanupImage = await page.screenshot({ type: 'jpeg', quality: 90 })
+		} catch (e) {
+			log(`  pre-clean capture skipped: ${String(e?.message || e)}`)
+		}
+		if (check.reason === 'brightdata_screenshot_loaded') {
+			log('  brightdata screenshot frame ready, skipping cleanup checks')
+			if (preCleanupImage) {
+				await writeFile(filePath, preCleanupImage)
+			} else {
+				assertBudget(startedAt, 'screenshot')
+				await page.screenshot({ path: filePath, type: 'jpeg', quality: 90 })
+			}
+			return { ok: true }
+		}
+
 		log('  cleanup + align...')
 		await cleanupCosmetic(page)
 		await alignToContent(page)
@@ -1245,20 +1527,68 @@ async function captureOne(context, { index, url }) {
 				}
 			}
 		}
+		if (!postCheck.ok && (postCheck.issueType === 'consent' || postCheck.issueType === 'overlay' || postCheck.reason === 'consent_like_unknown')) {
+			const removed = await forceRemoveBlockingLayers(page)
+			if (removed > 0) {
+				await waitDom(page, 5000)
+				await page.waitForTimeout(500)
+				postCheck = await inspectPage(page, HEALTH_POLICIES.direct)
+				log(`  health after post-clean force-clean: ok=${postCheck.ok ? 'yes' : 'no'} issue=${postCheck.issueType} reason=${postCheck.reason}`)
+			}
+		}
 		if (postCheck.ok && postCheck.hasSkeletonSignals) {
 			log('  post-cleanup skeleton detected, waiting extra render...')
+			const preSkeletonCheck = postCheck
 			await page.waitForTimeout(1800)
 			await waitDom(page, 5000)
 			postCheck = await inspectPage(page, HEALTH_POLICIES.direct)
 			log(`  health after skeleton wait: ok=${postCheck.ok ? 'yes' : 'no'} issue=${postCheck.issueType} reason=${postCheck.reason}`)
+			if (!postCheck.ok) {
+				log('  skeleton wait degraded frame, using pre-skeleton state')
+				postCheck = preSkeletonCheck
+			}
 		}
 		if (!postCheck.ok) {
+			if (preCleanupImage) {
+				const preCleanupQuality = assessFinalFrameQuality(check)
+				if (preCleanupQuality.ok) {
+					log(`  cleanup degraded frame, using pre-clean screenshot issue=${postCheck.issueType} reason=${postCheck.reason}`)
+					await writeFile(filePath, preCleanupImage)
+					return { ok: true }
+				}
+			}
 			throw new Error(`health_check_failed issue=${postCheck.issueType} reason=${postCheck.reason}`)
+		}
+
+		const finalQuality = assessFinalFrameQuality(postCheck)
+		log(
+			`  checklist source=${postCheck.hasSourceVisible ? 'yes' : 'no'}` +
+			` headline=${postCheck.hasHeadlineVisible ? 'yes' : 'no'}` +
+			` subtitle=${postCheck.hasSubtitleVisible ? 'yes' : 'no'}` +
+			` date=${postCheck.hasDateVisible ? 'yes' : 'no'}` +
+			` byline=${postCheck.hasBylineVisible ? 'yes' : 'no'}` +
+			` image=${postCheck.hasImageVisible ? 'yes' : 'no'}` +
+			` text=${postCheck.hasLeadTextVisible ? 'yes' : 'no'}` +
+			` overlay=${postCheck.hasBlockingOverlay ? 'yes' : 'no'}`
+		)
+		if (finalQuality.warnings?.length) {
+			log(`  checklist warning: ${finalQuality.warnings.join(',')}`)
+		}
+		if (!finalQuality.ok) {
+			log(`  final quality: fail reason=${finalQuality.reason}`)
+			if (preCleanupImage) {
+				const preCleanupQuality = assessFinalFrameQuality(check)
+				if (preCleanupQuality.ok) {
+					log(`  using pre-clean screenshot due better quality (${preCleanupQuality.reason})`)
+					await writeFile(filePath, preCleanupImage)
+					return { ok: true }
+				}
+			}
+			throw new Error(`health_check_failed issue=quality reason=${finalQuality.reason}`)
 		}
 
 		assertBudget(startedAt, 'screenshot')
 		log('  save screenshot...')
-		const filePath = join(IMG_DIR, `${index}.jpg`)
 		await page.screenshot({ path: filePath, type: 'jpeg', quality: 90 })
 		return { ok: true }
 	} catch (e) {

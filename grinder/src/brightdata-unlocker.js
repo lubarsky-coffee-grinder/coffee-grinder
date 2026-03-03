@@ -57,6 +57,21 @@ function looksLikeBase64Image(value) {
 	return /^[A-Za-z0-9+/=]+$/.test(v)
 }
 
+function looksLikeHttpUrl(value) {
+	try {
+		let url = new URL(String(value || '').trim())
+		return url.protocol === 'http:' || url.protocol === 'https:'
+	} catch {
+		return false
+	}
+}
+
+function looksLikeImageUrl(value) {
+	let url = String(value || '').trim()
+	if (!looksLikeHttpUrl(url)) return false
+	return /\.(png|jpe?g|webp|gif|bmp|svg)(\?|$)/i.test(url) || /(?:image|img|screenshot|render|snapshot)/i.test(url)
+}
+
 function parseJsonText(value) {
 	try {
 		return JSON.parse(String(value || '').trim())
@@ -167,6 +182,86 @@ function extractImagePayload(value, depth = 0) {
 		}
 	}
 	return null
+}
+
+function extractImageUrl(value, depth = 0) {
+	if (depth > 8 || value == null) return ''
+	if (typeof value === 'string') {
+		let raw = String(value || '').trim()
+		if (!raw) return ''
+		if (looksLikeImageUrl(raw)) return raw
+		if (raw.startsWith('{') || raw.startsWith('[')) {
+			let parsed = parseJsonText(raw)
+			if (!parsed) return ''
+			return extractImageUrl(parsed, depth + 1)
+		}
+		return ''
+	}
+	if (Array.isArray(value)) {
+		for (let item of value) {
+			let found = extractImageUrl(item, depth + 1)
+			if (found) return found
+		}
+		return ''
+	}
+	if (typeof value === 'object') {
+		const preferred = [
+			'screenshotUrl',
+			'screenshot_url',
+			'imageUrl',
+			'image_url',
+			'downloadUrl',
+			'download_url',
+			'resourceUrl',
+			'resource_url',
+			'url',
+			'screenshot',
+			'image',
+			'body',
+			'data',
+			'result',
+			'response',
+			'content',
+		]
+		for (let key of preferred) {
+			if (!(key in value)) continue
+			let found = extractImageUrl(value[key], depth + 1)
+			if (found) return found
+		}
+		for (let key of Object.keys(value)) {
+			let found = extractImageUrl(value[key], depth + 1)
+			if (found) return found
+		}
+	}
+	return ''
+}
+
+function inferMimeFromUrl(url) {
+	let text = String(url || '').toLowerCase()
+	if (text.includes('.png')) return 'image/png'
+	if (text.includes('.webp')) return 'image/webp'
+	if (text.includes('.gif')) return 'image/gif'
+	if (text.includes('.bmp')) return 'image/bmp'
+	if (text.includes('.svg')) return 'image/svg+xml'
+	return 'image/jpeg'
+}
+
+async function fetchImageAsBase64(imageUrl, timeoutMs) {
+	try {
+		const response = await withTimeout(fetch(imageUrl, { method: 'GET', redirect: 'follow' }), timeoutMs, 'brightdata_image_fetch')
+		if (!response?.ok) return null
+		const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+		if (contentType && !contentType.startsWith('image/')) return null
+		const bytes = await withTimeout(response.arrayBuffer(), timeoutMs, 'brightdata_image_bytes')
+		const base64 = Buffer.from(bytes).toString('base64')
+		if (!looksLikeBase64Image(base64)) return null
+		const mime = contentType.startsWith('image/')
+			? contentType.split(';')[0].trim()
+			: inferMimeFromUrl(imageUrl)
+		return { mime, base64 }
+	} catch {
+		return null
+	}
 }
 
 function pickStatusCode(value) {
@@ -466,6 +561,13 @@ export async function captureScreenshotWithBrightData(url) {
 				timeoutMs,
 			})
 			let image = extractImagePayload(response)
+			let imageUrl = ''
+			if (!image) {
+				imageUrl = extractImageUrl(response)
+				if (imageUrl) {
+					image = await fetchImageAsBase64(imageUrl, Math.min(15000, timeoutMs))
+				}
+			}
 			let statusResponse = response
 			if (!image && state.mode === 'scrape') {
 				let jsonResponse = await requestScreenshotWithBrightData(state, {
@@ -474,6 +576,12 @@ export async function captureScreenshotWithBrightData(url) {
 					timeoutMs,
 				})
 				image = extractImagePayload(jsonResponse)
+				if (!image) {
+					imageUrl = extractImageUrl(jsonResponse)
+					if (imageUrl) {
+						image = await fetchImageAsBase64(imageUrl, Math.min(15000, timeoutMs))
+					}
+				}
 				if (image) statusResponse = jsonResponse
 			}
 			if (image) {
@@ -490,7 +598,7 @@ export async function captureScreenshotWithBrightData(url) {
 				reason: 'empty_image',
 				limitReached: false,
 				statusCode: pickStatusCode(statusResponse),
-				error: '',
+				error: imageUrl ? `image_url_unreadable:${imageUrl.slice(0, 180)}` : '',
 			}
 		} catch (error) {
 			let c = classifyError(error)
