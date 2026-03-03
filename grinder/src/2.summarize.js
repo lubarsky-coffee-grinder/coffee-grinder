@@ -8,7 +8,7 @@ import { topics, topicsMap, normalizeTopic } from '../config/topics.js'
 import { decodeGoogleNewsUrl } from './google-news.js'
 import { extractArticleInfo, findAlternativeArticles } from './newsapi.js'
 import { ai } from './ai.js'
-import { collectFacts, collectVideos, collectTitleByUrl, describeFactsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
+import { collectFacts, collectTalkingPoints, collectVideos, collectTitleByUrl, describeFactsSettings, describeTalkingPointsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
 import { extractFallbackKeywords, describeFallbackKeywordsSettings } from './fallback-keywords.js'
 import { logRunApiStats, logRunTotalCost } from './cost.js'
 import { ensureSummaryAttribution } from './summary-attribution.js'
@@ -16,6 +16,7 @@ import { ensureSummaryAttribution } from './summary-attribution.js'
 const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
 const FALLBACK_MAX_KEYWORDS = 20
+const TALKING_POINTS_MAX_ITEMS = 5
 
 const STOPWORDS = new Set([
 	'the', 'and', 'for', 'with', 'from', 'that', 'this', 'these', 'those', 'into', 'over', 'under',
@@ -117,6 +118,31 @@ function normalizeText(text) {
 	return String(text ?? '').replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim()
 }
 
+function readCachedArticleText(id) {
+	let key = String(id ?? '').trim()
+	if (!key) return ''
+	let file = `articles/${key}.txt`
+	if (!fs.existsSync(file)) return ''
+	let raw = ''
+	try {
+		raw = String(fs.readFileSync(file, 'utf8') || '')
+	} catch {
+		return ''
+	}
+	let text = normalizeText(raw)
+	if (!text) return ''
+
+	// Cache file format is "<title>\n\n<text>", so prefer payload when long enough.
+	let parts = text.split(/\n\s*\n/g).map(s => s.trim()).filter(Boolean)
+	if (parts.length >= 2) {
+		let payload = parts.slice(1).join('\n\n').trim()
+		if (payload.length >= MIN_TEXT_LENGTH) {
+			return payload.slice(0, MAX_TEXT_LENGTH)
+		}
+	}
+	return text.slice(0, MAX_TEXT_LENGTH)
+}
+
 function hasMeaningfulText(value) {
 	let text = String(value ?? '')
 		.replace(/\u200B/g, '')
@@ -216,6 +242,93 @@ function normalizeFactsValue(value) {
 	return out.join('\n').trim()
 }
 
+function normalizeTalkingPointsValue(value) {
+	let raw = String(value ?? '')
+		.replace(/\r/g, '')
+		.trim()
+	if (!raw) return ''
+
+	raw = raw
+		.replace(/^```(?:\w+)?\s*/i, '')
+		.replace(/\s*```$/, '')
+		.trim()
+
+	let parts = raw
+		.split(/\n\s*\n/g)
+		.map(s => s.trim())
+		.filter(Boolean)
+
+	if (parts.length < 2) {
+		parts = raw
+			.split('\n')
+			.map(s => s.trim())
+			.filter(Boolean)
+	}
+
+	let out = []
+	for (let part of parts) {
+		let line = part
+			.replace(/^[•*\-\u2022]+\s*/, '')
+			.replace(/^\d+[.)]\s*/, '')
+			.replace(/\s+/g, ' ')
+			.trim()
+		if (!line) continue
+		out.push(line)
+	}
+
+	return out.slice(0, TALKING_POINTS_MAX_ITEMS).join('\n\n').trim()
+}
+
+function buildTalkingPointsInput({
+	articleText,
+	titleEn,
+	titleRu,
+	summary,
+	factsRu,
+	source,
+	url,
+}) {
+	let fullText = String(articleText || '').trim()
+	if (fullText.length > MIN_TEXT_LENGTH) return fullText
+
+	let title = String(titleRu || titleEn || '').trim()
+	let summaryText = String(summary || '').trim()
+	let sourceText = String(source || '').trim()
+	let urlText = String(url || '').trim()
+	let factsText = String(factsRu || '')
+		.replace(/\r/g, '\n')
+		.split('\n')
+		.map(s => s.trim())
+		.filter(Boolean)
+		.slice(0, 8)
+		.join('\n')
+	let shortExtract = fullText ? fullText.slice(0, 3000) : ''
+
+	let chunks = []
+	if (title) chunks.push(`Title: ${title}`)
+	if (sourceText) chunks.push(`Source: ${sourceText}`)
+	if (summaryText) chunks.push(`Summary:\n${summaryText}`)
+	if (factsText) chunks.push(`Known facts:\n${factsText}`)
+	if (shortExtract) chunks.push(`Article extract:\n${shortExtract}`)
+	if (urlText) chunks.push(`URL: ${urlText}`)
+
+	return chunks.join('\n\n').trim()
+}
+
+function talkingPointsStats(value) {
+	let points = String(value ?? '')
+		.split(/\n\s*\n/g)
+		.map(s => s.trim())
+		.filter(Boolean)
+	let wordCounts = points.map(point =>
+		point
+			.replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+			.split(/\s+/)
+			.filter(Boolean).length
+	)
+	return { count: points.length, wordCounts }
+}
+
 function escapeHtml(text) {
 	return String(text)
 		.replaceAll('&', '&amp;')
@@ -233,27 +346,43 @@ function wrapHtml({ url, html, text }) {
 	return `<!--\n${url}\n-->`
 }
 
-function missingProcessingFields(e) {
+function processingNeeds(e) {
+	let needsSummary = !hasMeaningfulText(e.summary)
+	let needsFacts = !hasMeaningfulText(e.factsRu)
+	let needsTalkingPoints = !hasMeaningfulText(e.talkingPointsRu)
+	let needsVideos = !hasVideoLinks(e.videoUrls)
+	let needsUsedUrl = !hasMeaningfulText(e.usedUrl)
+
 	let missing = []
-	if (!hasMeaningfulText(e.summary)) missing.push('summary')
-	if (!hasMeaningfulText(e.factsRu)) missing.push('factsRu')
-	if (!hasVideoLinks(e.videoUrls)) missing.push('videoUrls')
-	if (!hasMeaningfulText(e.usedUrl)) missing.push('usedUrl')
-	return missing
+	if (needsSummary) missing.push('summary')
+	if (needsFacts) missing.push('factsRu')
+	if (needsTalkingPoints) missing.push('talkingPointsRu')
+	if (needsVideos) missing.push('videoUrls')
+	if (needsUsedUrl) missing.push('usedUrl')
+
+	return {
+		needsSummary,
+		needsFacts,
+		needsTalkingPoints,
+		needsVideos,
+		needsUsedUrl,
+		needsContent: needsSummary || needsFacts || needsTalkingPoints || needsVideos,
+		missing,
+	}
 }
 
 function processingDecision(e) {
 	if (e.topic === 'other') {
 		return { shouldProcess: false, reason: 'topic=other', missing: [] }
 	}
-	let missing = missingProcessingFields(e)
-	if (!missing.length) {
+	let needs = processingNeeds(e)
+	if (!needs.missing.length) {
 		return { shouldProcess: false, reason: 'already_complete', missing: [] }
 	}
 	return {
 		shouldProcess: true,
-		reason: `needs=${missing.join(',')}`,
-		missing,
+		reason: `needs=${needs.missing.join(',')}`,
+		missing: needs.missing,
 	}
 }
 
@@ -403,7 +532,7 @@ async function tryOtherAgencies(e, primaryUrl) {
 }
 
 export async function summarize() {
-	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'videoUrls', 'duplicateUrl'])
+	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'talkingPointsRu', 'videoUrls', 'duplicateUrl'])
 
 	news.forEach((e, i) => e.id ||= i + 1)
 
@@ -456,6 +585,7 @@ export async function summarize() {
 		urlDecode: { time: 0, delay: 30e3, increment: 1000 },
 		ai: { time: 0, delay: 0 },
 		facts: { time: 0, delay: 0 },
+		talkingPoints: { time: 0, delay: 0 },
 		videos: { time: 0, delay: 0 },
 	}
 	for (let i = 0; i < list.length; i++) {
@@ -467,22 +597,34 @@ export async function summarize() {
 			`reason=${row.reason}`,
 			e.titleEn || e.titleRu || '',
 		)
-		let articleText = ''
+		let articleText = readCachedArticleText(e.id)
+		if (articleText.length > MIN_TEXT_LENGTH) {
+			log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
+		}
 		let sourceUrl = normalizeHttpUrl(e.url)
+		let needsAtStart = processingNeeds(e)
 
 		if (!sourceUrl /*&& !restricted.includes(e.source)*/) {
 			if (!e.gnUrl) {
-				log('SKIP processing: missing url and gnUrl')
-				stats.fail++
-				continue
+				let canFallbackTalkingPointsOnly = needsAtStart.needsTalkingPoints
+					&& !needsAtStart.needsSummary
+					&& !needsAtStart.needsFacts
+					&& !needsAtStart.needsVideos
+				if (!canFallbackTalkingPointsOnly) {
+					log('SKIP processing: missing url and gnUrl')
+					stats.fail++
+					continue
+				}
+				log('No url/gnUrl, fallback to existing fields for talking points')
+			} else {
+				sourceUrl = await decodeWithThrottle(last, e.gnUrl)
+				if (!sourceUrl) {
+					await sleep(5*60e3)
+					i--
+					continue
+				}
+				log('got', sourceUrl)
 			}
-			sourceUrl = await decodeWithThrottle(last, e.gnUrl)
-			if (!sourceUrl) {
-				await sleep(5*60e3)
-				i--
-				continue
-			}
-			log('got', sourceUrl)
 		}
 		if (sourceUrl) {
 			// Always keep the actually used source URL:
@@ -490,8 +632,9 @@ export async function summarize() {
 			e.usedUrl = sourceUrl
 		}
 
-		const needsTextWork = !hasMeaningfulText(e.summary) || !hasMeaningfulText(e.factsRu) || !hasVideoLinks(e.videoUrls)
-		if (sourceUrl && needsTextWork) {
+		const initialNeeds = processingNeeds(e)
+		const needsTextWork = initialNeeds.needsContent
+		if (sourceUrl && needsTextWork && articleText.length <= MIN_TEXT_LENGTH) {
 			log('Extracting', e.source || '', 'article...', `url=${sourceUrl}`)
 			let extracted = await extractVerified(sourceUrl)
 			if (!extracted) {
@@ -524,11 +667,22 @@ export async function summarize() {
 			}
 		}
 
-		const shouldSummarize = articleText.length > 400 && !hasMeaningfulText(e.summary)
-		const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH && !hasMeaningfulText(e.factsRu)
-		const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && !hasVideoLinks(e.videoUrls)
+		const currentNeeds = processingNeeds(e)
+		const talkingPointsInput = buildTalkingPointsInput({
+			articleText,
+			titleEn: e.titleEn,
+			titleRu: e.titleRu,
+			summary: e.summary,
+			factsRu: e.factsRu,
+			source: e.source,
+			url: e.usedUrl || sourceUrl || e.url,
+		})
+		const shouldSummarize = articleText.length > 400 && currentNeeds.needsSummary
+		const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsFacts
+		const shouldCollectTalkingPoints = hasMeaningfulText(talkingPointsInput) && currentNeeds.needsTalkingPoints
+		const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsVideos
 
-		if (shouldSummarize || shouldCollectFacts || shouldCollectVideos) {
+		if (shouldSummarize || shouldCollectFacts || shouldCollectTalkingPoints || shouldCollectVideos) {
 			let enrichInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText }
 			let tasks = []
 			const makeLogger = (task) => (...params) => task.logs.push(params)
@@ -561,6 +715,23 @@ export async function summarize() {
 						await sleep(last.facts.time + last.facts.delay - Date.now())
 						last.facts.time = Date.now()
 						return await collectFacts(enrichInput, { logger: makeLogger(task) })
+					}
+				}
+				tasks.push(task)
+			}
+
+			if (shouldCollectTalkingPoints) {
+				log('Collecting talking points...', describeTalkingPointsSettings())
+				let task = {
+					name: 'talking_points',
+					logs: [],
+					run: async () => {
+						await sleep(last.talkingPoints.time + last.talkingPoints.delay - Date.now())
+						last.talkingPoints.time = Date.now()
+						return await collectTalkingPoints(
+							{ ...enrichInput, text: talkingPointsInput },
+							{ logger: makeLogger(task) }
+						)
 					}
 				}
 				tasks.push(task)
@@ -626,6 +797,22 @@ export async function summarize() {
 						log('facts done', `${factsRu.length} chars`)
 					} else {
 						log('facts failed (empty result)')
+					}
+					continue
+				}
+
+				if (task.name === 'talking_points') {
+					let talkingPointsRu = normalizeTalkingPointsValue(result.value)
+					if (talkingPointsRu) {
+						e.talkingPointsRu = talkingPointsRu
+						let stats = talkingPointsStats(talkingPointsRu)
+						if (stats.count !== TALKING_POINTS_MAX_ITEMS) {
+							log('talking points format warning', `points=${stats.count}`, `expected=${TALKING_POINTS_MAX_ITEMS}`)
+						}
+						log('talking points words', ...stats.wordCounts.map((wc, idx) => `p${idx + 1}=${wc}`))
+						log('talking points done', `${talkingPointsRu.length} chars`)
+					} else {
+						log('talking points failed (empty result)')
 					}
 					continue
 				}

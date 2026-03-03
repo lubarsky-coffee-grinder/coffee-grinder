@@ -109,15 +109,22 @@ test('slides use configured template presentation and placeholders', async () =>
 
 	// Act: create presentation and add one slide.
 	const presId = await slides.createPresentation()
-	await slides.addSlide({
-		sqk: 1,
-		topicId: 3,
-		topicSqk: 1,
-		titleEn: 'Test title',
-		summary: 'Test summary',
-		priority: 2,
-		url: 'https://example.com/article'
-	})
+		await slides.addSlide({
+			sqk: 1,
+			topicId: 3,
+			topicSqk: 1,
+			titleEn: 'Test title',
+			summary: 'Test summary',
+			priority: 2,
+			url: 'https://example.com/article',
+			talkingPointsRu: [
+				'“Первый длинный заголовок в кавычках” Очень длинный первый talking point с дополнительными пояснениями и деталями для теста ограничения длины на слайде?',
+				'“Второй длинный заголовок в кавычках” Ещё один длинный talking point с лишними словами, чтобы проверить автоматическое сжатие текста при вставке в notes?',
+				'“Третий длинный заголовок в кавычках” Третий пример для проверки лимита количества talking points в блоке на слайде?',
+				'“Четвертый длинный заголовок в кавычках” Этот пункт не должен попасть на слайд, потому что действует ограничение по количеству?',
+			].join('\n\n'),
+			factsRu: '- Тестовый факт',
+		})
 
 	// Assert template copy happened with the configured ID.
 	assert.equal(presId, 'NEW_PRESENTATION')
@@ -132,6 +139,15 @@ test('slides use configured template presentation and placeholders', async () =>
 	)
 	assert.ok(replaceReq, 'Expected replaceAllText for {{cat3_card1}}')
 	assert.match(String(replaceReq.replaceAllText?.replaceText), /^1\sTest title/)
+
+	const notesReq = batchCalls[0]?.requestBody?.requests?.find(
+		r => r.replaceAllText?.containsText?.text === '{{notes}}'
+	)
+	assert.ok(notesReq, 'Expected replaceAllText for {{notes}}')
+	assert.match(String(notesReq.replaceAllText?.replaceText), /Talking points:/)
+	assert.match(String(notesReq.replaceAllText?.replaceText), /Факты:/)
+	const talkingBulletCount = (String(notesReq.replaceAllText?.replaceText).match(/^- /gm) || []).length
+	assert.equal(talkingBulletCount, 4, 'Talking points on slide should keep all provided bullets')
 })
 
 test.after(async () => {

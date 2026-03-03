@@ -117,9 +117,17 @@ mock.module(mod('sleep.js'), {
 	mock.module(mod('enrich.js'), {
 		namedExports: {
 			collectFacts: async ({ url }) => `- Факт для ${url}\n- Еще один факт`,
+			collectTalkingPoints: async ({ url }) => [
+				`“Кто платит, тот задаёт рамку решения” В истории по ${url} источники ресурсов определяют границы допустимых действий и переговорную позицию участников. Если финансовые потоки управляются извне, автономия решений становится условной. Где заканчивается поддержка и начинается внешнее управление?`,
+				`“Доверие к институтам проверяется ценой ошибки” Реакция системы на сигнал зависит не от громкости заявлений, а от репутационного капитала тех, кто сигнал подаёт. Когда прошлые просчёты не разобраны публично, даже точные предупреждения воспринимаются как давление. Кто оплачивает стоимость институционального недоверия?`,
+				`“Стимулы сильнее деклараций о принципах” Формальные заявления сторон выглядят последовательными, но поведение обычно следует за материальными стимулами и санкционными рисками. Поэтому реальные решения часто противоречат официальной риторике и ожиданиям аудитории. Какие стимулы здесь главные, а какие лишь витрина?`,
+				`“Цифры создают иллюзию управляемости процесса” Публичные метрики дают ощущение контроля, но без контекста источников, горизонта и методики они легко превращаются в политический аргумент. Одни и те же числа могут обосновывать противоположные стратегии. Какие допущения скрыты за этими цифрами?`,
+				`“Легитимность держится на прозрачности процедуры” Даже прагматичное решение теряет поддержку, если обществу не объяснены критерии выбора и цена альтернатив. Институциональная устойчивость возникает не из лозунгов, а из предсказуемых правил и подотчётности. Кто выигрывает, когда процедура остаётся непрозрачной?`,
+			].join('\n\n'),
 			collectVideos: async ({ url }) => `- https://youtube.com/watch?v=mock-${encodeURIComponent(url)}`,
 			collectTitleByUrl: async () => ({ titleEn: '', titleRu: '', extra: '' }),
 			describeFactsSettings: () => 'model=mock',
+			describeTalkingPointsSettings: () => 'model=mock',
 			describeVideosSettings: () => 'model=mock',
 			describeTitleLookupSettings: () => 'model=mock',
 		}
@@ -142,6 +150,12 @@ const { summarize } = await import(mod('2.summarize.js'))
 
 test('summarize pipeline (mocked)', async () => {
 	fs.mkdirSync(articlesDir, { recursive: true })
+	for (const row of newsRows) {
+		const htmlPath = path.join(articlesDir, `${row.id}.html`)
+		const txtPath = path.join(articlesDir, `${row.id}.txt`)
+		if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath)
+		if (fs.existsSync(txtPath)) fs.unlinkSync(txtPath)
+	}
 
 		await summarize()
 
@@ -165,6 +179,7 @@ test('summarize pipeline (mocked)', async () => {
 			)
 		}
 		assert.ok(updated.factsRu && String(updated.factsRu).length > 10, `Missing factsRu for id=${row.id}`)
+		assert.ok(updated.talkingPointsRu && String(updated.talkingPointsRu).length > 10, `Missing talkingPointsRu for id=${row.id}`)
 		assert.ok(updated.videoUrls && String(updated.videoUrls).length > 10, `Missing videoUrls for id=${row.id}`)
 		assert.ok(updated.aiTopic, `Missing aiTopic for id=${row.id}`)
 		assert.ok(updated.aiPriority, `Missing aiPriority for id=${row.id}`)
