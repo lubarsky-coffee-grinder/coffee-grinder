@@ -2,25 +2,21 @@ import OpenAI from 'openai'
 
 import { spreadsheetId } from './store.js'
 import { log } from './log.js'
-import { sleep } from './sleep.js'
+import { readEnv } from './env.js'
 import { getPrompt } from './prompts.js'
 import { estimateAndLogCost } from './cost.js'
+import { buildChatCompletionsRequest } from './openai-request-templates.js'
 
 const openai = new OpenAI()
 
 const DEFAULT_OPENAI_MODEL = 'gpt-5-mini'
-const FALLBACK_OPENAI_MODEL = 'gpt-4o-mini'
 const SUMMARIZE_TEMPERATURE = 0
+const SUMMARIZE_REASONING_EFFORT = 'medium'
+const SUMMARY_SOURCE_GUARDRAIL = 'ВАЖНО!!! НИКОГДА НЕ ДОБАВЛЯЙ ИСТОЧНИК В SUMMARY И НЕ ПИШИ ФРАЗЫ ТИПА "ПО ДАННЫМ ...". МЫ ДОБАВЛЯЕМ ИСТОЧНИК САМИ В ПАЙПЛАЙНЕ!!!'
 
-const explicitModel = process.env.OPENAI_SUMMARIZE_MODEL || process.env.OPENAI_MODEL
-const modelSource = process.env.OPENAI_SUMMARIZE_MODEL
-	? 'OPENAI_SUMMARIZE_MODEL'
-	: process.env.OPENAI_MODEL
-		? 'OPENAI_MODEL'
-		: 'default'
-
-let model = explicitModel || DEFAULT_OPENAI_MODEL
-let summaryTemperature = temperatureForModel(model)
+const explicitModel = readEnv('OPENAI_SUMMARIZE_MODEL')
+const modelSource = explicitModel ? 'OPENAI_SUMMARIZE_MODEL' : 'default'
+const model = explicitModel || DEFAULT_OPENAI_MODEL
 
 const RESPONSE_FORMAT = {
 	type: 'json_schema',
@@ -29,54 +25,33 @@ const RESPONSE_FORMAT = {
 		schema: {
 			type: 'object',
 			additionalProperties: false,
-			properties: {
-				titleRu: { type: 'string' },
-				summary: { type: 'string' },
-				topic: { type: 'string' },
-				priority: { type: 'integer', minimum: 1, maximum: 5 },
+				properties: {
+					titleRu: { type: 'string' },
+					summary: { type: 'string' },
+					topic: { type: 'string' },
+					priority: { type: 'integer', minimum: 1, maximum: 5 },
+				},
+				required: ['titleRu', 'summary', 'topic', 'priority'],
 			},
-			required: ['titleRu', 'summary', 'topic', 'priority'],
+			strict: true,
 		},
-		strict: true,
-	},
-}
-
-function temperatureForModel(nextModel) {
-	if ((nextModel || '').toLowerCase().startsWith('gpt-5')) return undefined
-	return SUMMARIZE_TEMPERATURE
-}
+	}
 
 function describeSummarizeSettings(currentModel) {
 	let src = modelSource ? ` (${modelSource})` : ''
-	let tempLabel = summaryTemperature === undefined ? 'unset' : String(summaryTemperature)
-	return `api=chat.completions model=${currentModel}${src} temperature=${tempLabel} response_format=json_schema reasoning=unset`
+	let built = buildChatCompletionsRequest({
+		model: currentModel,
+		system: '',
+		user: '',
+		temperature: SUMMARIZE_TEMPERATURE,
+		reasoningEffort: SUMMARIZE_REASONING_EFFORT,
+	})
+	let tempLabel = built.temperature === undefined ? 'unset' : String(built.temperature)
+	return `api=chat.completions model=${currentModel}${src} temperature=${tempLabel} response_format=json_schema reasoning=${built.reasoning}`
 }
 
 function isUnsupportedModel(e) {
 	return e?.code === 'unsupported_model' || e?.error?.code === 'unsupported_model'
-}
-
-function isModelNotFound(e) {
-	return e?.code === 'model_not_found' || e?.status === 404
-}
-
-function isTransientApiError(e) {
-	let status = Number(e?.status || e?.statusCode || e?.response?.status)
-	if (status === 429) return true
-	if (status >= 500 && status <= 599) return true
-
-	let code = String(e?.code || e?.error?.code || '').toUpperCase()
-	if (code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'ECONNABORTED' || code === 'EAI_AGAIN') return true
-
-	let message = `${e?.message || ''} ${e?.error?.message || ''}`.toLowerCase()
-	return message.includes('timeout')
-}
-
-function isTemperatureUnsupported(e) {
-	const code = e?.code
-	const nested = e?.error?.code
-	const message = `${e?.message || ''} ${e?.error?.message || ''}`.toLowerCase()
-	return code === 'unsupported_value' || nested === 'unsupported_value' || message.includes('temperature')
 }
 
 let instructions = ''
@@ -85,17 +60,28 @@ let init = (async () => {
 	log('AI summarize:', describeSummarizeSettings(model))
 })()
 
-async function chatSummarize({ url, text, logger = log }) {
-	let content = `URL: ${url}\nText:\n${text}`
-	const request = {
+function withSummaryGuardrail(systemPrompt) {
+	let base = String(systemPrompt || '').trim()
+	if (!base) return SUMMARY_SOURCE_GUARDRAIL
+	if (base.includes(SUMMARY_SOURCE_GUARDRAIL)) return base
+	return `${base}\n\n${SUMMARY_SOURCE_GUARDRAIL}`
+}
+
+async function chatSummarize({ url, text, source, logger = log }) {
+	let content = [
+		`URL: ${url}`,
+		`Source: ${String(source || '').trim()}`,
+		`Text:\n${text}`,
+	].join('\n')
+	let built = buildChatCompletionsRequest({
 		model,
-		response_format: RESPONSE_FORMAT,
-		messages: [
-			{ role: 'system', content: instructions },
-			{ role: 'user', content },
-		],
-	}
-	if (summaryTemperature !== undefined) request.temperature = summaryTemperature
+		system: withSummaryGuardrail(instructions),
+		user: content,
+		responseFormat: RESPONSE_FORMAT,
+		temperature: SUMMARIZE_TEMPERATURE,
+		reasoningEffort: SUMMARIZE_REASONING_EFFORT,
+	})
+	const request = built.request
 
 	let res = await openai.chat.completions.create(request)
 	estimateAndLogCost({
@@ -127,46 +113,21 @@ async function chatSummarize({ url, text, logger = log }) {
 	return parsed
 }
 
-export async function ai({ url, text, logger = log }) {
+export async function ai({ url, text, source, logger = log }) {
 	await init
 
-	let retriedTransient = false
-	for (;;) {
-		try {
-			let res = await chatSummarize({ url, text, logger })
-			if (res) return res
-			logger('AI summarize: empty result')
-			return null
-		} catch (e) {
-			if (isTemperatureUnsupported(e) && summaryTemperature !== undefined) {
-				summaryTemperature = undefined
-				logger('AI summarize: temperature unsupported, retrying without temperature', '\n', e)
-				logger('AI summarize:', describeSummarizeSettings(model))
-				continue
-			}
-
-			if (isModelNotFound(e) && !explicitModel && model !== FALLBACK_OPENAI_MODEL) {
-				logger('AI model not found:', model, '\nFalling back to:', FALLBACK_OPENAI_MODEL, '\n', e)
-				model = FALLBACK_OPENAI_MODEL
-				summaryTemperature = temperatureForModel(model)
-				logger('AI summarize:', describeSummarizeSettings(model))
-				continue
-			}
-
-			if (isTransientApiError(e) && !retriedTransient) {
-				retriedTransient = true
-				logger('AI summarize: transient error, retrying once', '\n', e)
-				await sleep(1500)
-				continue
-			}
-
-			if (isUnsupportedModel(e)) {
-				logger('AI summarize: unsupported model\n', e)
-				return null
-			}
-
-			logger('AI fail\n', e)
+	try {
+		let res = await chatSummarize({ url, text, source, logger })
+		if (res) return res
+		logger('AI summarize: empty result')
+		return null
+	} catch (e) {
+		if (isUnsupportedModel(e)) {
+			logger('AI summarize: unsupported model\n', e)
 			return null
 		}
+
+		logger('AI fail\n', e)
+		return null
 	}
 }

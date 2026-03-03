@@ -3,15 +3,16 @@ import OpenAI from 'openai'
 import { spreadsheetId } from './store.js'
 import { getPrompt } from './prompts.js'
 import { log } from './log.js'
-import { sleep } from './sleep.js'
+import { readEnv } from './env.js'
 import { estimateAndLogCost } from './cost.js'
+import { buildChatCompletionsRequest } from './openai-request-templates.js'
 
 const openai = new OpenAI()
 
 const DEFAULT_MODEL = 'gpt-4.1-mini'
-const FALLBACK_MODEL = 'gpt-4.1'
+const KEYWORDS_REASONING_EFFORT = 'medium'
 
-const explicitModel = process.env.OPENAI_FALLBACK_KEYWORDS_MODEL
+const explicitModel = readEnv('OPENAI_FALLBACK_KEYWORDS_MODEL')
 const model = explicitModel || DEFAULT_MODEL
 const modelSource = explicitModel ? 'OPENAI_FALLBACK_KEYWORDS_MODEL' : ''
 
@@ -34,22 +35,6 @@ const RESPONSE_FORMAT = {
 		},
 		strict: true,
 	},
-}
-
-function isModelNotFound(e) {
-	return e?.code === 'model_not_found' || e?.status === 404
-}
-
-function isTransientApiError(e) {
-	let status = Number(e?.status || e?.statusCode || e?.response?.status)
-	if (status === 429) return true
-	if (status >= 500 && status <= 599) return true
-
-	let code = String(e?.code || e?.error?.code || '').toUpperCase()
-	if (code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'ECONNABORTED' || code === 'EAI_AGAIN') return true
-
-	let message = `${e?.message || ''} ${e?.error?.message || ''}`.toLowerCase()
-	return message.includes('timeout')
 }
 
 function uniq(list) {
@@ -75,7 +60,15 @@ function normalizeKeywords(list, allowed) {
 
 export function describeFallbackKeywordsSettings() {
 	let src = modelSource ? ` (${modelSource})` : ''
-	return `api=chat.completions model=${model}${src} temperature=0 response_format=json_schema`
+	let built = buildChatCompletionsRequest({
+		model,
+		system: '',
+		user: '',
+		temperature: 0,
+		reasoningEffort: KEYWORDS_REASONING_EFFORT,
+	})
+	let tempLabel = built.temperature === undefined ? 'unset' : String(built.temperature)
+	return `api=chat.completions model=${model}${src} temperature=${tempLabel} response_format=json_schema reasoning=${built.reasoning}`
 }
 
 export async function extractFallbackKeywords(url, manualKeywords, limit = 8, { logger = log } = {}) {
@@ -91,51 +84,31 @@ export async function extractFallbackKeywords(url, manualKeywords, limit = 8, { 
 		`Max keywords: ${limit}`,
 	].join('\n')
 
-	let models = !explicitModel && model !== FALLBACK_MODEL
-		? [model, FALLBACK_MODEL]
-		: [model]
+	try {
+		let built = buildChatCompletionsRequest({
+			model,
+			system: prompt,
+			user,
+			responseFormat: RESPONSE_FORMAT,
+			temperature: 0,
+			reasoningEffort: KEYWORDS_REASONING_EFFORT,
+		})
+		let res = await openai.chat.completions.create(built.request)
+		estimateAndLogCost({
+			task: 'fallback_keywords',
+			model,
+			usage: res?.usage,
+			logger,
+		})
+		let content = res?.choices?.[0]?.message?.content
+		if (!content) return []
 
-	for (let m of models) {
-		let retriedTransient = false
-		for (;;) {
-			try {
-				let res = await openai.chat.completions.create({
-					model: m,
-					temperature: 0,
-					response_format: RESPONSE_FORMAT,
-					messages: [
-						{ role: 'system', content: prompt },
-						{ role: 'user', content: user },
-					],
-				})
-				estimateAndLogCost({
-					task: 'fallback_keywords',
-					model: m,
-					usage: res?.usage,
-					logger,
-				})
-				let content = res?.choices?.[0]?.message?.content
-				if (!content) return []
-
-				let parsed
-				try { parsed = JSON.parse(content) } catch { return [] }
-				let keywords = normalizeKeywords(parsed?.keywords, allowed).slice(0, limit)
-				return keywords
-			} catch (e) {
-				if (isModelNotFound(e) && !explicitModel && m !== FALLBACK_MODEL) {
-					logger('FALLBACK_KEYWORDS model not available:', m, 'falling back to:', FALLBACK_MODEL)
-					break
-				}
-				if (isTransientApiError(e) && !retriedTransient) {
-					retriedTransient = true
-					logger('FALLBACK_KEYWORDS transient error, retrying once\n', e)
-					await sleep(1500)
-					continue
-				}
-				logger('FALLBACK_KEYWORDS AI failed\n', e)
-				return []
-			}
-		}
+		let parsed
+		try { parsed = JSON.parse(content) } catch { return [] }
+		let keywords = normalizeKeywords(parsed?.keywords, allowed).slice(0, limit)
+		return keywords
+	} catch (e) {
+		logger('FALLBACK_KEYWORDS AI failed\n', e)
+		return []
 	}
-	return []
 }

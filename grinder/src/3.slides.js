@@ -20,6 +20,21 @@ function hasSummary(value) {
 	return String(value ?? '').trim().length > 0
 }
 
+function collectDuplicateScreenshotUrls(list) {
+	let groups = new Map()
+	for (let event of list) {
+		let key = normalizeHttpUrl(event.usedUrl || event.url)
+		if (!key) continue
+		let bucket = groups.get(key)
+		if (!bucket) {
+			bucket = []
+			groups.set(key, bucket)
+		}
+		bucket.push(event)
+	}
+	return [...groups.entries()].filter(([, events]) => events.length > 1)
+}
+
 export async function slides() {
 	log()
 	const hadPresentation = !!(await presentationExists())
@@ -54,6 +69,24 @@ export async function slides() {
 		hasSummary(e.summary) &&
 		(hadPresentation ? !e.sqk : true),
 	)
+	let duplicateGroups = collectDuplicateScreenshotUrls(list)
+	if (duplicateGroups.length > 0) {
+		log(`SLIDES_DUP_URL found=${duplicateGroups.length}`)
+		for (let [url, events] of duplicateGroups) {
+			log(`SLIDES_DUP_URL url=${url} count=${events.length}`)
+			for (let event of events) {
+				log(
+					'  row',
+					`id=${event.id || ''}`,
+					`sqk=${event.sqk || ''}`,
+					`source=${event.source || ''}`,
+					`title=${event.titleRu || event.titleEn || ''}`,
+					`url=${normalizeHttpUrl(event.url) || String(event.url || '').trim()}`,
+					`usedUrl=${normalizeHttpUrl(event.usedUrl) || String(event.usedUrl || '').trim()}`,
+				)
+			}
+		}
+	}
 	for (let i = 0; i < list.length; i++) {
 		let event = list[i]
 		const topicKey = resolvedTopic.get(event)
@@ -79,9 +112,34 @@ export async function slides() {
 	}
 
 	let screenshots = list
-		.map(e => ({ sqk: e.sqk, url: normalizeHttpUrl(e.usedUrl || e.url) }))
+		.map(e => {
+			let url = normalizeHttpUrl(e.usedUrl || e.url)
+			let urlField = normalizeHttpUrl(e.usedUrl) ? 'usedUrl' : 'url'
+			let source = String(e.source || '').replace(/\s+/g, ' ').trim()
+			let title = String(e.titleRu || e.titleEn || '').replace(/\s+/g, ' ').trim().slice(0, 180)
+			return {
+				sqk: e.sqk,
+				url,
+				source,
+				title,
+				urlField,
+				rowId: String(e.id || '').trim(),
+				rawUrl: String(e.url || '').trim(),
+				rawUsedUrl: String(e.usedUrl || '').trim(),
+			}
+		})
 		.filter(e => e.sqk && e.url)
-		.map(e => `${e.sqk}\n${e.url}\n`)
+		.map(e => {
+			let meta = [
+				`source=${encodeURIComponent(e.source)}`,
+				`title=${encodeURIComponent(e.title)}`,
+				`url_field=${encodeURIComponent(e.urlField)}`,
+				`row_id=${encodeURIComponent(e.rowId)}`,
+				`raw_url=${encodeURIComponent(e.rawUrl)}`,
+				`raw_used_url=${encodeURIComponent(e.rawUsedUrl)}`,
+			].join('||')
+			return `${e.sqk}\n${e.url}||${meta}\n`
+		})
 		.join('')
 	fs.writeFileSync('../img/screenshots.txt', screenshots)
 	log('\nScreenshots list saved')

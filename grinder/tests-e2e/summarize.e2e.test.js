@@ -99,7 +99,7 @@ test('e2e: summarize writes artifacts into test sheet', { timeout: 25 * 60_000, 
 	// Keep E2E cheap by default; allow overriding via env.
 	process.env.OPENAI_SUMMARIZE_MODEL ||= 'gpt-4o-mini'
 	process.env.OPENAI_FACTS_MODEL ||= 'gpt-4.1-mini'
-	process.env.OPENAI_VIDEOS_MODEL ||= 'gpt-4.1-mini'
+	process.env.OPENAI_VIDEO_VERIFY_MODEL ||= 'gpt-4o-mini'
 	process.env.OPENAI_WEBSEARCH_CONTEXT_SIZE ||= 'low'
 
 	await ensureSheet(spreadsheetId, 'news')

@@ -157,6 +157,13 @@ test('summarize pipeline (mocked)', async () => {
 		const updated = byId.get(String(row.id))
 		assert.ok(updated, `Missing updated row for id=${row.id}`)
 		assert.ok(updated.summary && String(updated.summary).length > 10, `Missing summary for id=${row.id}`)
+		assert.match(String(updated.summary), /по данным/i, `Missing attribution phrase for id=${row.id}`)
+		if (updated.source) {
+			assert.ok(
+				String(updated.summary).toLowerCase().includes(String(updated.source).toLowerCase()),
+				`Missing source label in summary for id=${row.id}`
+			)
+		}
 		assert.ok(updated.factsRu && String(updated.factsRu).length > 10, `Missing factsRu for id=${row.id}`)
 		assert.ok(updated.videoUrls && String(updated.videoUrls).length > 10, `Missing videoUrls for id=${row.id}`)
 		assert.ok(updated.aiTopic, `Missing aiTopic for id=${row.id}`)

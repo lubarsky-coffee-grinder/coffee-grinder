@@ -100,6 +100,7 @@ export async function uploadFolder(localPath, parentFolderId, folderName, extens
 		folderId = created.data.id
 		log(`Created new folder: ${folderName}`)
 	}
+	log('Upload target folder:', `https://drive.google.com/drive/folders/${folderId}`)
 
 	// ?????????????????? ??????????
 	for (let fileName of filesToUpload) {
