@@ -3,7 +3,8 @@ import fs from 'fs'
 import { log } from './log.js'
 import { news } from './store.js'
 import { topics, normalizeTopic } from '../config/topics.js'
-import { presentationExists, createPresentation, addSlide } from './google-slides.js'
+import { presentationExists, createPresentation, addSlide, clearUnfilledCardPlaceholders, archiveCurrentPresentationSnapshot } from './google-slides.js'
+import { recordRunLink, presentationLink } from './run-links.js'
 
 function normalizeHttpUrl(value) {
 	if (!value) return ''
@@ -35,10 +36,21 @@ function collectDuplicateScreenshotUrls(list) {
 	return [...groups.entries()].filter(([, events]) => events.length > 1)
 }
 
+function runTag() {
+	let value = String(process.env.RUN_TAG || '').trim()
+	if (value) return value
+	let d = new Date()
+	let pad = n => String(n).padStart(2, '0')
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
+}
+
 export async function slides() {
 	log()
 	const hadPresentation = !!(await presentationExists())
-	await createPresentation()
+	const livePresentationId = await createPresentation()
+	if (livePresentationId) {
+		recordRunLink('slides_live', presentationLink(livePresentationId))
+	}
 
 	let resolvedTopic = new Map(news.map(e => [e, normalizeTopic(e.topic)]))
 
@@ -143,6 +155,19 @@ export async function slides() {
 		.join('')
 	fs.writeFileSync('../img/screenshots.txt', screenshots)
 	log('\nScreenshots list saved')
+
+	log('Clearing unfilled category cards...')
+	let clearResult = await clearUnfilledCardPlaceholders()
+	log('Unfilled cards cleanup done',
+		`placeholders=${clearResult?.placeholdersCleared || 0}`,
+		`deleted_cards=${clearResult?.cardsDeleted || 0}`,
+	)
+
+	let archivedPresentationId = await archiveCurrentPresentationSnapshot(runTag())
+	if (archivedPresentationId) {
+		recordRunLink('archive_slides_snapshot', presentationLink(archivedPresentationId))
+	}
+	log('Presentation snapshot archived')
 }
 
 if (process.argv[1].endsWith('slides')) slides()

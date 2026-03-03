@@ -16,6 +16,11 @@ const openai = new OpenAI()
 
 const DEFAULT_FACTS_MODEL = 'gpt-4o'
 const DEFAULT_TITLE_LOOKUP_MODEL = DEFAULT_FACTS_MODEL
+const L3_TALKING_POINTS_MODEL = 'gpt-5.2'
+const L3_TALKING_POINTS_REASONING_EFFORT = 'high'
+const L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE = 'medium'
+const L3_TALKING_POINTS_USER_LOCATION = { type: 'approximate' }
+const L3_TALKING_POINTS_VECTOR_STORE_IDS = ['vs_699e12566b64819196d2870def837004']
 
 const FACTS_TEMPERATURE = 0
 const TITLE_LOOKUP_TEMPERATURE = 0
@@ -33,6 +38,9 @@ const titleLookupModelSource = explicitTitleLookupModel
 	: explicitFactsModel
 		? 'OPENAI_FACTS_MODEL'
 		: 'default'
+
+const talkingPointsModel = L3_TALKING_POINTS_MODEL
+const resolvedTalkingPointsVectorStoreIds = L3_TALKING_POINTS_VECTOR_STORE_IDS
 
 function webSearchOptions() {
 	let search_context_size = readEnv('OPENAI_WEBSEARCH_CONTEXT_SIZE')
@@ -64,6 +72,20 @@ function formatWebSearchOptions(opts) {
 	return parts.length ? parts.join(' ') : 'context=default'
 }
 
+function talkingPointsTools() {
+	return [
+		{
+			type: 'file_search',
+			vector_store_ids: resolvedTalkingPointsVectorStoreIds,
+		},
+		{
+			type: 'web_search',
+			search_context_size: L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE,
+			user_location: L3_TALKING_POINTS_USER_LOCATION,
+		},
+	]
+}
+
 export function describeFactsSettings() {
 	let temp = resolveWebSearchTemperatureConfig(factsModel, FACTS_TEMPERATURE)
 	let tempLabel = temp.temperature === undefined ? 'unset' : String(temp.temperature)
@@ -82,6 +104,11 @@ export function describeTitleLookupSettings() {
 	let reasoning = temp.reasoning ? 'reasoning.effort=none' : `reasoning.effort=${TITLE_LOOKUP_REASONING_EFFORT}`
 	let src = titleLookupModelSource ? ` (${titleLookupModelSource})` : ''
 	return `api=responses tool=web_search model=${titleLookupModel}${src} temp=${tempLabel} ${reasoning} ${formatWebSearchOptions(webSearchOptions())}`
+}
+
+export function describeTalkingPointsSettings() {
+	let vectorStoreInfo = `vector_stores=${resolvedTalkingPointsVectorStoreIds.join(',')}`
+	return `api=responses tools=file_search,web_search model=${talkingPointsModel} store=true reasoning.effort=${L3_TALKING_POINTS_REASONING_EFFORT} web_search_context=${L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE} user_location=approximate ${vectorStoreInfo}`
 }
 
 async function responseWithWebSearch({ model, system, user, label, task, temperature, logger = log }) {
@@ -116,6 +143,47 @@ async function responseWithWebSearch({ model, system, user, label, task, tempera
 	}
 }
 
+async function responseWithTools({
+	model,
+	system,
+	user,
+	label,
+	task,
+	tools,
+	reasoningEffort = 'low',
+	store = false,
+	logger = log,
+}) {
+	try {
+		let body = {
+			model,
+			input: [
+				{ role: 'system', content: system },
+				{ role: 'user', content: user },
+			],
+			tools: Array.isArray(tools) ? tools : [],
+			reasoning: { effort: reasoningEffort },
+		}
+		if (store) body.store = true
+		let res = await openai.post('/responses', { body })
+		estimateAndLogCost({
+			task,
+			model,
+			usage: res?.usage,
+			response: res,
+			fallbackWebSearchCalls: Array.isArray(tools) && tools.some(t => t?.type === 'web_search') ? 1 : 0,
+			logger,
+		})
+		let content = extractResponseOutputText(res)
+		if (content) return content.trim()
+		logger(label, 'AI empty response')
+		return
+	} catch (e) {
+		logger(label, 'AI failed\n', e)
+		return
+	}
+}
+
 export async function collectFacts({ titleEn, titleRu, text, url }, { logger = log } = {}) {
 	let prompt = await getPrompt(spreadsheetId, 'summarize:facts')
 	let title = titleRu || titleEn || ''
@@ -127,6 +195,23 @@ export async function collectFacts({ titleEn, titleRu, text, url }, { logger = l
 		label: 'FACTS',
 		task: 'facts',
 		temperature: FACTS_TEMPERATURE,
+		logger,
+	})
+}
+
+export async function collectTalkingPoints({ titleEn, titleRu, text, url }, { logger = log } = {}) {
+	let prompt = await getPrompt(spreadsheetId, 'summarize:talking-points')
+	let title = titleRu || titleEn || ''
+	let input = `URL: ${url}\nTitle: ${title}\n\nArticle text:\n${text}`
+	return await responseWithTools({
+		model: talkingPointsModel,
+		system: prompt,
+		user: input,
+		label: 'TALKING_POINTS',
+		task: 'talking_points',
+		tools: talkingPointsTools(),
+		reasoningEffort: L3_TALKING_POINTS_REASONING_EFFORT,
+		store: true,
 		logger,
 	})
 }

@@ -1,5 +1,13 @@
 import { log } from './log.js'
 
+function shortError(e) {
+	if (!e) return 'unknown error'
+	let message = e?.message || String(e)
+	let causeMessage = e?.cause?.message
+	if (causeMessage && causeMessage !== message) return `${message}: ${causeMessage}`
+	return message
+}
+
 export async function fetchArticle(url) {
 	for (let i = 0; i < 2; i++) {
 		try {
@@ -13,7 +21,7 @@ export async function fetchArticle(url) {
 				return
 			}
 		} catch(e) {
-			log('article fetch failed', e)
+			log('article fetch failed', shortError(e))
 		}
 	}
 	// let response

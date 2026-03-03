@@ -1,7 +1,7 @@
 import { log } from './log.js'
 import { htmlToText } from './html-to-text.js'
 import { fetchArticle } from './fetch-article.js'
-import { JSDOM } from 'jsdom'
+import { JSDOM, VirtualConsole } from 'jsdom'
 import { trackApiRequest, trackApiResult } from './cost.js'
 
 const ER_API_BASE = 'https://eventregistry.org/api/v1'
@@ -105,7 +105,8 @@ function pickFirstMeta(document, selectors) {
 function parseArticleFromHtml(html) {
 	let dom
 	try {
-		dom = new JSDOM(html)
+		let virtualConsole = new VirtualConsole()
+		dom = new JSDOM(html, { virtualConsole })
 	} catch {
 		return
 	}

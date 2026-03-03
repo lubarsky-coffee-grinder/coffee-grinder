@@ -27,6 +27,14 @@ function activeArchiveFolderId() {
 	return isAutoMode() ? autoArchiveFolderId : archiveFolderId
 }
 
+function currentRunTag() {
+	let value = String(process.env.RUN_TAG || '').trim()
+	if (value) return value
+	let d = new Date()
+	let pad = n => String(n).padStart(2, '0')
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
+}
+
 let slides, presentationId
 let resolvedTemplateSlideId
 let resolvedTemplateTableId
@@ -86,6 +94,54 @@ function readCellText(cell) {
 		out += part?.textRun?.content || ''
 	}
 	return out
+}
+
+function readTextElements(textElements) {
+	let out = ''
+	for (const part of textElements || []) {
+		out += part?.textRun?.content || ''
+	}
+	return out
+}
+
+function findCategoryCardPlaceholders(text) {
+	let raw = String(text || '')
+	let matches = raw.match(/\{\{cat\d+_card\d+\}\}/g) || []
+	return matches.map(v => String(v || '').trim()).filter(Boolean)
+}
+
+async function findUnfilledCategoryCardTargets() {
+	await init
+	const createdPresentationId = await createPresentation()
+	presentationId = createdPresentationId
+	const response = await slides.presentations.get({ presentationId })
+	const presentationSlides = response.data?.slides || []
+	const placeholders = new Set()
+	const shapeObjectIds = new Set()
+
+	for (const slide of presentationSlides) {
+		for (const element of slide?.pageElements || []) {
+			const shapeText = readTextElements(element?.shape?.text?.textElements || [])
+			const shapeMatches = findCategoryCardPlaceholders(shapeText)
+			if (shapeMatches.length) {
+				for (const match of shapeMatches) placeholders.add(match)
+				if (element?.objectId) shapeObjectIds.add(element.objectId)
+			}
+
+			const tableRows = element?.table?.tableRows || []
+			for (const row of tableRows) {
+				for (const cell of row?.tableCells || []) {
+					const cellMatches = findCategoryCardPlaceholders(readCellText(cell))
+					for (const match of cellMatches) placeholders.add(match)
+				}
+			}
+		}
+	}
+
+	return {
+		placeholders: [...placeholders],
+		shapeObjectIds: [...shapeObjectIds],
+	}
 }
 
 async function resolveTemplatePlaceholderCells() {
@@ -272,14 +328,47 @@ function formatFactsForSlide(value) {
 	return outLines.join('\n')
 }
 
-function buildReplaceMap({ titleWithSource, summary, videosText, sqk, priority, factsText }) {
+function formatTalkingPointsForSlide(value) {
+	const text = String(value ?? '').replace(/\r/g, '').trim()
+	if (!text) return ''
+
+	const points = text
+		.split(/\n\s*\n/g)
+		.map(s => s.trim())
+		.filter(Boolean)
+
+	const out = []
+	for (const rawPoint of points) {
+		const point = rawPoint
+			.replace(/^[•*\-\u2022]+\s*/, '')
+			.replace(/^\d+[.)]\s*/, '')
+			.trim()
+		if (!point) continue
+		out.push(`- ${point}`)
+	}
+
+	return out.join('\n')
+}
+
+function buildNotesText({ talkingPointsText, factsText }) {
+	let blocks = []
+	if (talkingPointsText) {
+		blocks.push(`Talking points:\n${talkingPointsText}`)
+	}
+	if (factsText) {
+		blocks.push(`Факты:\n${factsText}`)
+	}
+	return blocks.join('\n\n')
+}
+
+function buildReplaceMap({ titleWithSource, summary, videosText, sqk, priority, notesText }) {
 	return {
 		'{{title}}': replaceWithDefault(titleWithSource),
 		'{{summary}}': replaceWithDefault(summary),
 		'{{videos}}': replaceWithDefault(videosText),
 		'{{sqk}}': replaceWithDefault(sqk),
 		'{{priority}}': replaceWithDefault(priority),
-		'{{notes}}': replaceWithDefault(factsText),
+		'{{notes}}': replaceWithDefault(notesText),
 	}
 }
 
@@ -375,6 +464,18 @@ export async function archivePresentation(name) {
 
   await moveFile(fileIdParam, targetFolderIdParam, newNameParam)
   presentationId = null
+	return fileIdParam
+}
+
+export async function archiveCurrentPresentationSnapshot(name = currentRunTag()) {
+	await init
+	if (!presentationId) return
+	let activeName = activePresentationName()
+	if (!activeName) return
+	let snapshotName = `${name}_${activeName}`
+	log('Archiving current presentation snapshot...', snapshotName)
+	let copied = await copyFile(presentationId, activeArchiveFolderId(), snapshotName)
+	return copied?.id
 }
 
 export async function presentationExists() {
@@ -407,6 +508,65 @@ export async function createPresentation() {
 	return presentationId
 }
 
+async function batchUpdateWithRetry(requests) {
+	const maxAttempts = 6
+	let backoffMs = 2000
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			await waitForWriteSlot()
+			await slides.presentations.batchUpdate({
+				presentationId,
+				requestBody: { requests },
+			})
+			markWriteDone()
+			return
+		} catch (e) {
+			log(e)
+			if (!isRateLimitError(e)) throw e
+			const retryAfterMs = getRetryAfterMs(e)
+			const jitterParam = 500
+			const delayMs = Math.max(retryAfterMs, backoffMs) + jitterMs(jitterParam)
+			await sleep(delayMs)
+			backoffMs = Math.min(backoffMs * 2, 120000)
+			limiterState.minDelayMs = Math.min(Math.max(limiterState.minDelayMs, 1600) + 250, 5000)
+		}
+	}
+
+	throw new Error('Could not update slides: persistent rate limit (429).')
+}
+
+export async function clearUnfilledCardPlaceholders(placeholders) {
+	let provided = Array.isArray(placeholders)
+		? placeholders.map(v => String(v || '').trim()).filter(Boolean)
+		: []
+	let discovered = await findUnfilledCategoryCardTargets()
+	let allPlaceholders = [...new Set([...provided, ...discovered.placeholders])]
+	let requests = []
+
+	for (let text of allPlaceholders) {
+		requests.push({
+			replaceAllText: {
+				containsText: { text },
+				replaceText: '\u200B',
+			},
+		})
+	}
+	for (let objectId of discovered.shapeObjectIds) {
+		requests.push({
+			deleteObject: { objectId },
+		})
+	}
+	if (!requests.length) {
+		return { placeholdersCleared: 0, cardsDeleted: 0 }
+	}
+	await batchUpdateWithRetry(requests)
+	return {
+		placeholdersCleared: allPlaceholders.length,
+		cardsDeleted: discovered.shapeObjectIds.length,
+	}
+}
+
 export async function addSlide(event) {
   await init
 
@@ -421,7 +581,9 @@ export async function addSlide(event) {
   const linkUrl = event.usedUrl || event.directUrl || event.url || ''
   const titleWithSource = [title, linkUrl].filter(Boolean).join('\n')
   const videosPayload = parseVideoLinks(event.videoUrls)
+  const talkingPointsText = formatTalkingPointsForSlide(event.talkingPointsRu)
   const factsText = formatFactsForSlide(event.factsRu || event.notes)
+  const notesText = buildNotesText({ talkingPointsText, factsText })
 
   const replaceMap = buildReplaceMap({
     titleWithSource,
@@ -429,7 +591,7 @@ export async function addSlide(event) {
     videosText: videosPayload.text,
     sqk: event.sqk,
     priority: event.priority,
-    factsText,
+    notesText,
   })
 
   // ??????????:
@@ -520,52 +682,7 @@ export async function addSlide(event) {
     }
   ]
 
-  // ???????????? ?? backoff ???? 429
-  const maxAttempts = 6
-  let backoffMs = 2000
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      await waitForWriteSlot()
-
-      const presentationIdParam = presentationId
-      const requestBodyParam = { requests }
-      const batchUpdateParams = {
-        presentationId: presentationIdParam,
-        requestBody: requestBodyParam
-      }
-
-      await slides.presentations.batchUpdate(batchUpdateParams)
-
-      // ???????????????? ???????????????? write, ?????????? ???????????????????? ???????????????? ???????? ?????? ????????????
-      markWriteDone()
-      return
-    } catch (e) {
-      log(e)
-
-      // ???????? ?????? ???? 429, ???? ???????????? ???????????? ??????????????
-      if (!isRateLimitError(e)) {
-        throw e
-      }
-
-      // ???? 429: Retry-After ???????? ????????, ?????????? backoff
-      const retryAfterMs = getRetryAfterMs(e)
-      const jitterParam = 500
-      const delayMs = Math.max(retryAfterMs, backoffMs) + jitterMs(jitterParam)
-
-      const sleepMsParam = delayMs
-      await sleep(sleepMsParam)
-
-      // ?????????????????????? backoff, ???? ????????????????????????
-      backoffMs = Math.min(backoffMs * 2, 120000)
-
-      // ?????????????????????????? ???????? ???????????????????????????? ??????????????????, ?????????? ???????? ???????????? 429
-      limiterState.minDelayMs = Math.min(Math.max(limiterState.minDelayMs, 1600) + 250, 5000)
-    }
-  }
-
-  // ???????? ?????????? ????????, ???????????? ?????? ?????????????? ??????????????????
-  throw new Error('???? ?????????????? ???????????????? ??????????: ???????????????????? rate limit (429).')
+  await batchUpdateWithRetry(requests)
 }
 
 if (process.argv[1].endsWith('google-slides')) {
