@@ -36,11 +36,7 @@ export async function uploadImg() {
 	if (liveFolderId) {
 		recordRunLink('img_current', folderLink(liveFolderId))
 	}
-	log('Archiving current images snapshot...')
-	let archiveSnapshotFolderId = await uploadFolder('../img', archiveFolder, `${tag}_${imageFolderName}`, ['.jpg', '.png'])
-	if (archiveSnapshotFolderId) {
-		recordRunLink('archive_img_snapshot', folderLink(archiveSnapshotFolderId))
-	}
+	log('Archive images snapshot skipped (disabled to avoid duplicate uploads)')
 	log('Images uploaded.')
 }
 
