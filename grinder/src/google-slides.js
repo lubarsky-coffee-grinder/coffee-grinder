@@ -430,7 +430,7 @@ function buildVideoLinkRequests({ tableId, videosCell, links }) {
 
 function resolveArgumentsCell(templatePlaceholderCells) {
 	let explicit = templatePlaceholderCells?.['{{arguments}}']
-	if (explicit) return explicit
+	if (explicit) return { ...explicit, clearBeforeInsert: true }
 
 	let factsCell = templatePlaceholderCells?.['{{notes}}']
 	if (!factsCell) return null
@@ -447,14 +447,21 @@ function resolveArgumentsCell(templatePlaceholderCells) {
 	let targetRowCols = Number(Array.isArray(rowColumnCounts) ? rowColumnCounts[targetRow] : 0)
 	if (!Number.isFinite(targetRowCols) || columnIndex >= targetRowCols) return null
 
-	return { rowIndex: targetRow, columnIndex }
+	return {
+		rowIndex: targetRow,
+		columnIndex,
+		// Fallback row (below {{notes}}) can be truly empty in template.
+		// deleteText(type=ALL) on an empty cell fails in Slides API.
+		clearBeforeInsert: false,
+	}
 }
 
-function buildTableCellTextRequests({ tableId, cell, text }) {
+function buildTableCellTextRequests({ tableId, cell, text, clearBeforeInsert = true }) {
 	if (!tableId || !cell) return []
 	let normalized = replaceWithDefault(text)
-	return [
-		{
+	let requests = []
+	if (clearBeforeInsert) {
+		requests.push({
 			deleteText: {
 				objectId: tableId,
 				cellLocation: {
@@ -463,7 +470,9 @@ function buildTableCellTextRequests({ tableId, cell, text }) {
 				},
 				textRange: { type: 'ALL' },
 			},
-		},
+		})
+	}
+	requests.push(
 		{
 			insertText: {
 				objectId: tableId,
@@ -487,7 +496,8 @@ function buildTableCellTextRequests({ tableId, cell, text }) {
 				style: { link: null },
 			},
 		},
-	]
+	)
+	return requests
 }
 
 function isRateLimitError(e) {
@@ -703,11 +713,13 @@ export async function addSlide(event) {
     tableId: newTableId,
     cell: factsCell,
     text: factsCellText,
+    clearBeforeInsert: true,
   })
   const argumentsCellRequests = buildTableCellTextRequests({
     tableId: newTableId,
     cell: argumentsCell,
     text: argumentsCellText,
+    clearBeforeInsert: argumentsCell?.clearBeforeInsert !== false,
   })
   if (!argumentsCell && argumentsCellText) {
     log('SLIDES arguments cell not found; skipped arguments placement', `sqk=${event.sqk ?? ''}`)
