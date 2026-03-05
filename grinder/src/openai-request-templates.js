@@ -43,12 +43,31 @@ function buildWebSearchTool(opts) {
 	return tool
 }
 
+function toResponsesTextFormat(responseFormat) {
+	let format = responseFormat
+	if (!format || typeof format !== 'object') return null
+
+	if (format.type === 'json_schema' && format.json_schema && typeof format.json_schema === 'object') {
+		let schema = format.json_schema
+		let name = String(schema.name || '').trim()
+		if (!name || !schema.schema || typeof schema.schema !== 'object') return null
+		return {
+			type: 'json_schema',
+			name,
+			schema: schema.schema,
+			strict: schema.strict !== false,
+		}
+	}
+	return null
+}
+
 export function buildResponsesWebSearchRequest({
 	model,
 	system,
 	user,
 	temperature,
 	webSearchOptions,
+	responseFormat,
 	reasoningEffort = 'low',
 }) {
 	let tempConfig = resolveResponsesTemperatureConfig(model, temperature)
@@ -70,6 +89,11 @@ export function buildResponsesWebSearchRequest({
 		if (effort) reasoning = { effort }
 	}
 	if (reasoning) request.reasoning = reasoning
+
+	let textFormat = toResponsesTextFormat(responseFormat)
+	if (textFormat) {
+		request.text = { format: textFormat }
+	}
 
 	return {
 		request,

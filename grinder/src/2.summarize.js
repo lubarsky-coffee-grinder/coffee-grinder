@@ -17,6 +17,7 @@ const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
 const FALLBACK_MAX_KEYWORDS = 20
 const TALKING_POINTS_MAX_ITEMS = 5
+const FORCE_OVERWRITE_SUPPORT_FIELDS = !/^(0|false|no|off)$/i.test(String(process.env.SUMMARIZE_FORCE_OVERWRITE || '').trim())
 
 const STOPWORDS = new Set([
 	'the', 'and', 'for', 'with', 'from', 'that', 'this', 'these', 'those', 'into', 'over', 'under',
@@ -80,6 +81,36 @@ function countKeywordHits(haystack, keywords) {
 	return hits
 }
 
+function textKeywords(value, limit = 16) {
+	let tokens = String(value || '')
+		.toLowerCase()
+		.split(/[^\p{L}\p{N}]+/gu)
+		.map(s => s.trim())
+		.filter(s => Array.from(s).length >= 4)
+		.filter(s => !STOPWORDS.has(s))
+		.filter(s => !/^\d+$/.test(s))
+	return uniq(tokens).slice(0, limit)
+}
+
+const GENERIC_STORY_KEYWORDS = new Set([
+	'live', 'update', 'updates', 'latest', 'breaking', 'story', 'news',
+	'middle', 'east', 'world', 'today',
+	'новости', 'обновления', 'срочно', 'сегодня',
+])
+
+function storyStrictKeywords(e, sourceUrl) {
+	let fromTitle = uniq([
+		...textKeywords(e?.titleEn, 12),
+		...textKeywords(e?.titleRu, 12),
+	]).filter(k => !GENERIC_STORY_KEYWORDS.has(k))
+
+	let fromUrl = urlKeywords(sourceUrl, 12)
+	return uniq([
+		...fromTitle,
+		...fromUrl.filter(k => !GENERIC_STORY_KEYWORDS.has(k)),
+	]).slice(0, 12)
+}
+
 function normalizeHttpUrl(value) {
 	if (!value) return ''
 	try {
@@ -114,11 +145,80 @@ function ensureColumns(table, cols) {
 	}
 }
 
+function migrateArgumentsColumn(table) {
+	table.headers ||= []
+	let normalizedHeaders = []
+	let seen = new Set()
+	for (let raw of table.headers) {
+		let key = String(raw ?? '').trim()
+		if (!key) continue
+		if (key === 'talkingPointsRu') key = 'arguments'
+		if (seen.has(key)) continue
+		seen.add(key)
+		normalizedHeaders.push(key)
+	}
+	table.headers = normalizedHeaders
+
+	for (let row of table || []) {
+		let oldValue = String(row?.talkingPointsRu ?? '').trim()
+		let newValue = String(row?.arguments ?? '').trim()
+		if (oldValue && !newValue) row.arguments = oldValue
+		if (Object.prototype.hasOwnProperty.call(row, 'talkingPointsRu')) delete row.talkingPointsRu
+	}
+}
+
 function normalizeText(text) {
 	return String(text ?? '').replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim()
 }
 
-function readCachedArticleText(id) {
+function normalizeDateIso(value) {
+	let raw = String(value ?? '').trim()
+	if (!raw) return ''
+
+	let parsed = new Date(raw)
+	if (Number.isFinite(parsed.getTime())) return parsed.toISOString()
+
+	let compact = raw.match(/^(\d{4})(\d{2})(\d{2})$/)
+	if (!compact) return ''
+	let normalized = new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`)
+	return Number.isFinite(normalized.getTime()) ? normalized.toISOString() : ''
+}
+
+function inferDateFromUrl(url) {
+	let normalizedUrl = normalizeHttpUrl(url)
+	if (!normalizedUrl) return ''
+
+	let path = ''
+	try {
+		path = new URL(normalizedUrl).pathname || ''
+	} catch {
+		return ''
+	}
+
+	let match = path.match(/(20\d{2})[\/._-](\d{1,2})[\/._-](\d{1,2})/)
+	if (!match) match = path.match(/\b(20\d{2})(\d{2})(\d{2})\b/)
+	if (!match) return ''
+
+	let year = Number(match[1])
+	let month = Number(match[2])
+	let day = Number(match[3])
+	if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return ''
+	if (month < 1 || month > 12 || day < 1 || day > 31) return ''
+
+	let resolved = new Date(Date.UTC(year, month - 1, day))
+	if (!Number.isFinite(resolved.getTime())) return ''
+	if (resolved.getUTCFullYear() !== year || resolved.getUTCMonth() !== month - 1 || resolved.getUTCDate() !== day) return ''
+	return resolved.toISOString()
+}
+
+function resolveStoryDate({ currentDate, sourceUrl, extractedPublishedAt }) {
+	return normalizeDateIso(extractedPublishedAt)
+		|| normalizeDateIso(currentDate)
+		|| inferDateFromUrl(sourceUrl)
+		|| ''
+}
+
+function readCachedArticleText(id, expectedUrl = '') {
 	let key = String(id ?? '').trim()
 	if (!key) return ''
 	let file = `articles/${key}.txt`
@@ -129,17 +229,16 @@ function readCachedArticleText(id) {
 	} catch {
 		return ''
 	}
-	let text = normalizeText(raw)
-	if (!text) return ''
+	let match = raw.match(/^URL:\s*(.+?)\s*\n(?:Title:\s*.*\n)?\s*\n([\s\S]*)$/i)
+	if (!match?.[1] || !match?.[2]) return ''
 
-	// Cache file format is "<title>\n\n<text>", so prefer payload when long enough.
-	let parts = text.split(/\n\s*\n/g).map(s => s.trim()).filter(Boolean)
-	if (parts.length >= 2) {
-		let payload = parts.slice(1).join('\n\n').trim()
-		if (payload.length >= MIN_TEXT_LENGTH) {
-			return payload.slice(0, MAX_TEXT_LENGTH)
-		}
-	}
+	let expected = normalizeHttpUrl(expectedUrl || '')
+	let cacheUrl = normalizeHttpUrl(match[1])
+	if (!cacheUrl) return ''
+	if (expected && cacheUrl !== expected) return ''
+
+	let text = normalizeText(match[2])
+	if (!text) return ''
 	return text.slice(0, MAX_TEXT_LENGTH)
 }
 
@@ -212,6 +311,54 @@ function normalizeVideoUrls(value) {
 	return urls.join('\n')
 }
 
+function isFactsRefusalLine(line) {
+	let normalized = String(line || '')
+		.toLowerCase()
+		.replace(/[«»"'`“”]/g, '')
+		.replace(/\.+$/g, '')
+		.replace(/\s+/g, ' ')
+		.trim()
+	return normalized === 'недостаточно надёжных дополняющих фактов'
+		|| normalized === 'недостаточно надежных дополняющих фактов'
+}
+
+function hasFactsRefusalMarker(value) {
+	let raw = String(value ?? '')
+		.replace(/\r/g, '\n')
+		.trim()
+	if (!raw) return false
+
+	let rows = raw
+		.split('\n')
+		.map(s => s.trim())
+		.filter(Boolean)
+	if (rows.some(isFactsRefusalLine)) return true
+
+	let normalized = raw
+		.toLowerCase()
+		.replace(/[«»"'`“”]/g, '')
+		.replace(/\s+/g, ' ')
+	return normalized.includes('недостаточно надёжных дополняющих фактов')
+		|| normalized.includes('недостаточно надежных дополняющих фактов')
+}
+
+function hasMeaningfulFacts(value) {
+	let text = String(value ?? '')
+		.replace(/\u200B/g, '')
+		.trim()
+	if (!text) return false
+
+	for (let row of text.split('\n')) {
+		let line = String(row || '')
+			.replace(/^[•*\-\u2022]+\s*/, '')
+			.trim()
+		if (!line) continue
+		if (isFactsRefusalLine(line)) continue
+		return true
+	}
+	return false
+}
+
 function normalizeFactsValue(value) {
 	let raw = String(value ?? '')
 		.replace(/\r/g, '')
@@ -236,6 +383,7 @@ function normalizeFactsValue(value) {
 			.replace(/\s+/g, ' ')
 			.trim()
 		if (!line) continue
+		if (isFactsRefusalLine(line)) continue
 		out.push(line)
 	}
 
@@ -346,18 +494,55 @@ function wrapHtml({ url, html, text }) {
 	return `<!--\n${url}\n-->`
 }
 
+function writeArticleCache(id, extracted, title = '') {
+	let key = String(id ?? '').trim()
+	if (!key) return
+	fs.writeFileSync(`articles/${key}.html`, wrapHtml(extracted))
+	let cacheUrl = normalizeHttpUrl(extracted?.url || '')
+	fs.writeFileSync(
+		`articles/${key}.txt`,
+		`URL: ${cacheUrl}\nTitle: ${title || ''}\n\n${extracted.text || ''}`
+	)
+}
+
+async function forceRefreshArticleTextForFacts(e, sourceUrl) {
+	let baseUrl = normalizeHttpUrl(e.usedUrl || sourceUrl || e.url)
+	if (!baseUrl) return ''
+
+	log('FACTS refusal marker detected -> force re-extract article text', `url=${baseUrl}`)
+	let extracted = await extractVerified(baseUrl)
+	if (!extracted) {
+		log('FACTS refusal: primary re-extract failed, trying another agency...')
+		extracted = await tryOtherAgencies(e, baseUrl)
+	}
+	if (!extracted?.text) return ''
+
+	e.usedUrl = extracted.url || baseUrl
+	let refreshedDate = resolveStoryDate({
+		currentDate: e.date,
+		sourceUrl: e.usedUrl || baseUrl,
+		extractedPublishedAt: extracted.publishedAt,
+	})
+	if (refreshedDate) e.date = refreshedDate
+	writeArticleCache(e.id, extracted, e.titleEn || e.titleRu || '')
+	log('FACTS refusal: refreshed article text', `${extracted.text.length} chars`, `usedUrl=${e.usedUrl}`)
+	return extracted.text
+}
+
 function processingNeeds(e) {
 	let needsSummary = !hasMeaningfulText(e.summary)
-	let needsFacts = !hasMeaningfulText(e.factsRu)
-	let needsTalkingPoints = !hasMeaningfulText(e.talkingPointsRu)
-	let needsVideos = !hasVideoLinks(e.videoUrls)
+	let needsFacts = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulFacts(e.factsRu)
+	let needsTalkingPoints = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulText(e.arguments)
+	let needsVideos = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasVideoLinks(e.videoUrls)
+	let needsDate = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulText(e.date)
 	let needsUsedUrl = !hasMeaningfulText(e.usedUrl)
 
 	let missing = []
 	if (needsSummary) missing.push('summary')
 	if (needsFacts) missing.push('factsRu')
-	if (needsTalkingPoints) missing.push('talkingPointsRu')
+	if (needsTalkingPoints) missing.push('arguments')
 	if (needsVideos) missing.push('videoUrls')
+	if (needsDate) missing.push('date')
 	if (needsUsedUrl) missing.push('usedUrl')
 
 	return {
@@ -365,6 +550,7 @@ function processingNeeds(e) {
 		needsFacts,
 		needsTalkingPoints,
 		needsVideos,
+		needsDate,
 		needsUsedUrl,
 		needsContent: needsSummary || needsFacts || needsTalkingPoints || needsVideos,
 		missing,
@@ -424,12 +610,14 @@ async function extractVerified(url) {
 		log(`Extract attempt ${attempt + 1}/2...`)
 		let info = await extractArticleInfo(url)
 		let text = normalizeText(info?.body)
+		let publishedAt = normalizeDateIso(info?.publishedAt || info?.dateTime || info?.date)
 		if (text.length > MIN_TEXT_LENGTH) {
 			return {
 				url,
 				title: info?.title,
 				text: text.slice(0, MAX_TEXT_LENGTH),
 				html: info?.bodyHtml,
+				publishedAt,
 			}
 		}
 		if (attempt === 0) log('No text extracted, retrying...')
@@ -486,10 +674,13 @@ async function tryOtherAgencies(e, primaryUrl) {
 	try { baseHost = new URL(sourceUrl).hostname } catch {}
 	let keywordsForMatch = keywords
 	if (keywordsForMatch.length) log('Fallback relevance keywords:', keywordsForMatch.join(' '))
+	let strictKeywords = storyStrictKeywords(e, sourceUrl)
+	if (strictKeywords.length) log('Fallback strict keywords:', strictKeywords.join(' '))
 
 	let minMatchHits = Math.min(2, keywordsForMatch.length)
 	let maxTries = 7
 	let tries = 0
+	let best = null
 
 	for (let a of candidates) {
 		if (tries >= maxTries) break
@@ -503,6 +694,7 @@ async function tryOtherAgencies(e, primaryUrl) {
 		}
 		let meta = `${a?.title || ''}\n${url}`
 		let metaHits = countKeywordHits(meta, searchKeywords)
+		let strictMetaHits = countKeywordHits(meta, strictKeywords)
 		let eventUri = a?.eventUri
 
 		log(
@@ -517,28 +709,39 @@ async function tryOtherAgencies(e, primaryUrl) {
 		log('Extracting fallback', a.source || '', 'article...')
 		let extracted = await extractVerified(url)
 		if (extracted) {
-			if (keywordsForMatch.length) {
-				let title = extracted.title || ''
-				let haystack = `${title}\n${extracted.text || ''}`
-				let totalHits = countKeywordHits(haystack, keywordsForMatch)
-				if (totalHits < minMatchHits) {
-					log('Skipping fallback (low relevance)', a.source || '', `hits=${totalHits}/${keywordsForMatch.length} total`, `url=${url}`)
-					continue
-				}
+			let title = extracted.title || ''
+			let haystack = `${title}\n${extracted.text || ''}`
+			let totalHits = countKeywordHits(haystack, keywordsForMatch)
+			if (keywordsForMatch.length && totalHits < minMatchHits) {
+				log('Skipping fallback (low relevance)', a.source || '', `hits=${totalHits}/${keywordsForMatch.length} total`, `url=${url}`)
+				continue
 			}
-			return extracted
+			let strictHits = countKeywordHits(haystack, strictKeywords)
+			if (strictKeywords.length && strictHits < 1 && strictMetaHits < 1) {
+				log('Skipping fallback (strict mismatch)', a.source || '', `strict_hits=${strictHits}/${strictKeywords.length}`, `url=${url}`)
+				continue
+			}
+			let score = totalHits * 10 + strictHits * 25 + metaHits * 5 + strictMetaHits * 10
+			if (!best || score > best.score) {
+				best = { score, extracted, source: a.source || '', url }
+			}
 		}
+	}
+	if (best?.extracted) {
+		log('Fallback selected', best.source || '', `score=${best.score}`, `url=${best.url}`)
+		return best.extracted
 	}
 }
 
 export async function summarize() {
-	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'talkingPointsRu', 'videoUrls', 'duplicateUrl'])
+	migrateArgumentsColumn(news)
+	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'arguments', 'videoUrls', 'duplicateUrl'])
 
 	news.forEach((e, i) => e.id ||= i + 1)
 
 	let rows = news.map((e, rowIndex) => {
 		let decision = processingDecision(e)
-		let dedupeKey = normalizeHttpUrl(e.usedUrl || e.url)
+		let dedupeKey = normalizeHttpUrl(e.url || e.usedUrl)
 		if (!dedupeKey && e.gnUrl) dedupeKey = String(e.gnUrl).trim()
 		return { e, rowIndex, dedupeKey, ...decision }
 	})
@@ -552,12 +755,17 @@ export async function summarize() {
 		let firstRunIndex = firstRunIndexByDedupeKey.get(row.dedupeKey)
 		if (firstRunIndex != null) {
 			row.skipReason = `duplicate_of_row=${firstRunIndex}`
+			row.e.factsRu = ''
+			row.e.arguments = ''
+			row.e.videoUrls = ''
+			row.e.date = ''
 			continue
 		}
 		firstRunIndexByDedupeKey.set(row.dedupeKey, row.runIndex)
 	}
 	let list = runRows.filter(row => !row.skipReason)
 	let skipped = runRows.filter(row => !!row.skipReason)
+	log('SUMMARIZE_FORCE_OVERWRITE', FORCE_OVERWRITE_SUPPORT_FIELDS ? 'on' : 'off', 'dedupe=on', 'fields=factsRu,arguments,videoUrls,date')
 	log(
 		'SUMMARIZE_ROWS',
 		`total=${runRows.length}`,
@@ -597,11 +805,15 @@ export async function summarize() {
 			`reason=${row.reason}`,
 			e.titleEn || e.titleRu || '',
 		)
-		let articleText = readCachedArticleText(e.id)
-		if (articleText.length > MIN_TEXT_LENGTH) {
-			log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
-		}
+		let articleText = ''
 		let sourceUrl = normalizeHttpUrl(e.url)
+		let previousUsedUrl = normalizeHttpUrl(e.usedUrl)
+		if (FORCE_OVERWRITE_SUPPORT_FIELDS) {
+			e.factsRu = ''
+			e.arguments = ''
+			e.videoUrls = ''
+			e.date = ''
+		}
 		let needsAtStart = processingNeeds(e)
 
 		if (!sourceUrl /*&& !restricted.includes(e.source)*/) {
@@ -630,6 +842,24 @@ export async function summarize() {
 			// Always keep the actually used source URL:
 			// start with original URL, then overwrite with fallback URL if selected later.
 			e.usedUrl = sourceUrl
+			if (!hasMeaningfulText(e.date)) {
+				let inferredDate = inferDateFromUrl(sourceUrl)
+				if (inferredDate) e.date = inferredDate
+			}
+			articleText = readCachedArticleText(e.id, sourceUrl)
+			if (articleText.length > MIN_TEXT_LENGTH) {
+				log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
+			}
+		}
+
+		let sourceChanged = !!(sourceUrl && previousUsedUrl && previousUsedUrl !== sourceUrl)
+		if (sourceChanged) {
+			log('Source URL changed for row -> forcing full refresh', `prev=${previousUsedUrl}`, `now=${sourceUrl}`)
+			e.summary = ''
+			e.factsRu = ''
+			e.arguments = ''
+			e.videoUrls = ''
+			e.date = ''
 		}
 
 		const initialNeeds = processingNeeds(e)
@@ -643,10 +873,20 @@ export async function summarize() {
 			}
 			if (extracted) {
 				e.usedUrl = extracted.url || sourceUrl
+				let fallbackUsed = normalizeHttpUrl(e.usedUrl) && normalizeHttpUrl(sourceUrl) && normalizeHttpUrl(e.usedUrl) !== normalizeHttpUrl(sourceUrl)
+				if (fallbackUsed && extracted.title) {
+					e.titleEn = extracted.title
+					e.titleRu = ''
+				}
+				let resolvedDate = resolveStoryDate({
+					currentDate: e.date,
+					sourceUrl: e.usedUrl || sourceUrl,
+					extractedPublishedAt: extracted.publishedAt,
+				})
+				if (resolvedDate) e.date = resolvedDate
 				log('got', extracted.text.length, 'chars')
-				fs.writeFileSync(`articles/${e.id}.html`, wrapHtml(extracted))
 				articleText = extracted.text
-				fs.writeFileSync(`articles/${e.id}.txt`, `${e.titleEn || e.titleRu || ''}\n\n${articleText}`)
+				writeArticleCache(e.id, extracted, e.titleEn || e.titleRu || '')
 			} else {
 				log('Could not extract article text. Trying URL title lookup...', describeTitleLookupSettings())
 				try {
@@ -666,20 +906,32 @@ export async function summarize() {
 				}
 			}
 		}
+		if (!hasMeaningfulText(e.date) && sourceUrl) {
+			let inferredDate = inferDateFromUrl(e.usedUrl || sourceUrl)
+			if (inferredDate) e.date = inferredDate
+		}
 
 		const currentNeeds = processingNeeds(e)
+		const forceSupportRefreshForNewSummary = articleText.length > MIN_TEXT_LENGTH
+			&& currentNeeds.needsSummary
+			&& (hasMeaningfulFacts(e.factsRu) || hasMeaningfulText(e.arguments))
+		if (forceSupportRefreshForNewSummary) {
+			log('Summary is missing while facts/talking points exist -> regenerating support blocks')
+		}
 		const talkingPointsInput = buildTalkingPointsInput({
 			articleText,
 			titleEn: e.titleEn,
 			titleRu: e.titleRu,
 			summary: e.summary,
-			factsRu: e.factsRu,
+			factsRu: forceSupportRefreshForNewSummary ? '' : e.factsRu,
 			source: e.source,
 			url: e.usedUrl || sourceUrl || e.url,
 		})
 		const shouldSummarize = articleText.length > 400 && currentNeeds.needsSummary
-		const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsFacts
-		const shouldCollectTalkingPoints = hasMeaningfulText(talkingPointsInput) && currentNeeds.needsTalkingPoints
+		const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH
+			&& (currentNeeds.needsFacts || forceSupportRefreshForNewSummary)
+		const shouldCollectTalkingPoints = hasMeaningfulText(talkingPointsInput)
+			&& (currentNeeds.needsTalkingPoints || forceSupportRefreshForNewSummary)
 		const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsVideos
 
 		if (shouldSummarize || shouldCollectFacts || shouldCollectTalkingPoints || shouldCollectVideos) {
@@ -687,26 +939,26 @@ export async function summarize() {
 			let tasks = []
 			const makeLogger = (task) => (...params) => task.logs.push(params)
 
-				if (shouldSummarize) {
-					log('Summarizing', articleText.length, 'chars...')
-					let task = {
-						name: 'summary',
-						logs: [],
-						run: async () => {
-							await sleep(last.ai.time + last.ai.delay - Date.now())
-							last.ai.time = Date.now()
-							return await ai({
-								url: e.usedUrl || sourceUrl || e.url,
-								source: e.source,
-								text: articleText,
-								logger: makeLogger(task),
-							})
-						}
+			if (shouldSummarize) {
+				log('Summarizing', articleText.length, 'chars...')
+				let task = {
+					name: 'summary',
+					logs: [],
+					run: async () => {
+						await sleep(last.ai.time + last.ai.delay - Date.now())
+						last.ai.time = Date.now()
+						return await ai({
+							url: e.usedUrl || sourceUrl || e.url,
+							source: e.source,
+							text: articleText,
+							logger: makeLogger(task),
+						})
 					}
-					tasks.push(task)
 				}
+				tasks.push(task)
+			}
 
-				if (shouldCollectFacts) {
+			if (shouldCollectFacts) {
 				log('Collecting facts...', describeFactsSettings())
 				let task = {
 					name: 'facts',
@@ -791,6 +1043,36 @@ export async function summarize() {
 				}
 
 				if (task.name === 'facts') {
+					if (hasFactsRefusalMarker(result.value)) {
+						log('facts failed (refusal marker)')
+						let refreshedText = await forceRefreshArticleTextForFacts(e, sourceUrl)
+						if (refreshedText.length > MIN_TEXT_LENGTH) {
+							articleText = refreshedText
+							let retryInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText }
+							log('Collecting facts retry after forced text refresh...', describeFactsSettings())
+							await sleep(last.facts.time + last.facts.delay - Date.now())
+							last.facts.time = Date.now()
+							let retryRaw = await collectFacts(retryInput, { logger: log })
+							if (hasFactsRefusalMarker(retryRaw)) {
+								log('facts failed again (refusal marker after refresh)')
+								e.factsRu = ''
+								continue
+							}
+							let retryFacts = normalizeFactsValue(retryRaw)
+							if (retryFacts) {
+								e.factsRu = retryFacts
+								log('facts done after refresh', `${retryFacts.length} chars`)
+							} else {
+								e.factsRu = ''
+								log('facts failed after refresh (empty result)')
+							}
+						} else {
+							log('facts failed: could not refresh article text')
+							e.factsRu = ''
+						}
+						continue
+					}
+
 					let factsRu = normalizeFactsValue(result.value)
 					if (factsRu) {
 						e.factsRu = factsRu
@@ -802,15 +1084,15 @@ export async function summarize() {
 				}
 
 				if (task.name === 'talking_points') {
-					let talkingPointsRu = normalizeTalkingPointsValue(result.value)
-					if (talkingPointsRu) {
-						e.talkingPointsRu = talkingPointsRu
-						let stats = talkingPointsStats(talkingPointsRu)
+					let argumentsText = normalizeTalkingPointsValue(result.value)
+					if (argumentsText) {
+						e.arguments = argumentsText
+						let stats = talkingPointsStats(argumentsText)
 						if (stats.count !== TALKING_POINTS_MAX_ITEMS) {
 							log('talking points format warning', `points=${stats.count}`, `expected=${TALKING_POINTS_MAX_ITEMS}`)
 						}
 						log('talking points words', ...stats.wordCounts.map((wc, idx) => `p${idx + 1}=${wc}`))
-						log('talking points done', `${talkingPointsRu.length} chars`)
+						log('talking points done', `${argumentsText.length} chars`)
 					} else {
 						log('talking points failed (empty result)')
 					}

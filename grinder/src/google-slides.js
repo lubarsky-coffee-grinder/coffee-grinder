@@ -157,8 +157,10 @@ async function resolveTemplatePlaceholderCells() {
 	const slide = response.data?.slides?.find(s => s.objectId === slideIdParam) ?? response.data?.slides?.[0]
 	const table = slide?.pageElements?.find(e => e.objectId === tableIdParam && e.table)?.table
 
-	const placeholders = ['{{title}}', '{{videos}}', '{{notes}}']
+	const placeholders = ['{{title}}', '{{videos}}', '{{notes}}', '{{arguments}}']
 	const out = {}
+	const tableRows = table?.tableRows || []
+	const rowColumnCounts = tableRows.map(row => row?.tableCells?.length || 0)
 	for (let rowIndex = 0; rowIndex < (table?.tableRows?.length || 0); rowIndex++) {
 		const row = table.tableRows[rowIndex]
 		for (let columnIndex = 0; columnIndex < (row?.tableCells?.length || 0); columnIndex++) {
@@ -170,6 +172,10 @@ async function resolveTemplatePlaceholderCells() {
 				}
 			}
 		}
+	}
+	out.__meta = {
+		rowCount: tableRows.length,
+		rowColumnCounts,
 	}
 
 	resolvedTemplatePlaceholderCells = out
@@ -292,6 +298,17 @@ function parseVideoLinks(value) {
 	return { text: '', links: [] }
 }
 
+function stripUrls(value) {
+	return String(value ?? '')
+		.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi, '$1')
+		.replace(/https?:\/\/\S+/gi, '')
+		.replace(/(?:^|\s)www\.\S+/gi, ' ')
+		.replace(/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:\/[^\s]*)?/gi, '')
+		.replace(/\|\|/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+}
+
 function formatFactsForSlide(value) {
 	const text = String(value ?? '').replace(/\r/g, '').trim()
 	if (!text) return ''
@@ -307,17 +324,14 @@ function formatFactsForSlide(value) {
 		const line = rawLine.replace(/^[•*\-\u2022]+\s*/, '').trim()
 		if (!line) continue
 
-		let fact = line
-		let url = ''
+		let fact = stripUrls(line)
 		if (line.includes('||')) {
-			const [factPart, ...rest] = line.split('||')
-			fact = String(factPart ?? '').trim()
-			url = String(rest.join('||') ?? '').trim()
+			const [factPart] = line.split('||')
+			fact = stripUrls(factPart)
 		} else {
 			const firstUrlMatch = line.match(/https?:\/\/\S+/i)
 			if (firstUrlMatch) {
-				url = String(firstUrlMatch[0]).replace(/[),.;!?]+$/g, '').trim()
-				fact = line.replace(firstUrlMatch[0], '').replace(/\s+/g, ' ').trim()
+				fact = stripUrls(line.replace(firstUrlMatch[0], ' '))
 			}
 		}
 
@@ -339,7 +353,7 @@ function formatTalkingPointsForSlide(value) {
 
 	const out = []
 	for (const rawPoint of points) {
-		const point = rawPoint
+		const point = stripUrls(rawPoint)
 			.replace(/^[•*\-\u2022]+\s*/, '')
 			.replace(/^\d+[.)]\s*/, '')
 			.trim()
@@ -350,25 +364,13 @@ function formatTalkingPointsForSlide(value) {
 	return out.join('\n')
 }
 
-function buildNotesText({ talkingPointsText, factsText }) {
-	let blocks = []
-	if (talkingPointsText) {
-		blocks.push(`Talking points:\n${talkingPointsText}`)
-	}
-	if (factsText) {
-		blocks.push(`Факты:\n${factsText}`)
-	}
-	return blocks.join('\n\n')
-}
-
-function buildReplaceMap({ titleWithSource, summary, videosText, sqk, priority, notesText }) {
+function buildReplaceMap({ titleWithSource, summary, videosText, sqk, priority }) {
 	return {
 		'{{title}}': replaceWithDefault(titleWithSource),
 		'{{summary}}': replaceWithDefault(summary),
 		'{{videos}}': replaceWithDefault(videosText),
 		'{{sqk}}': replaceWithDefault(sqk),
 		'{{priority}}': replaceWithDefault(priority),
-		'{{notes}}': replaceWithDefault(notesText),
 	}
 }
 
@@ -424,6 +426,68 @@ function buildVideoLinkRequests({ tableId, videosCell, links }) {
 			},
 		},
 	}))
+}
+
+function resolveArgumentsCell(templatePlaceholderCells) {
+	let explicit = templatePlaceholderCells?.['{{arguments}}']
+	if (explicit) return explicit
+
+	let factsCell = templatePlaceholderCells?.['{{notes}}']
+	if (!factsCell) return null
+
+	let rowIndex = Number(factsCell.rowIndex)
+	let columnIndex = Number(factsCell.columnIndex)
+	if (!Number.isFinite(rowIndex) || !Number.isFinite(columnIndex)) return null
+
+	let targetRow = rowIndex + 1
+	let rowCount = Number(templatePlaceholderCells?.__meta?.rowCount || 0)
+	if (!Number.isFinite(rowCount) || targetRow >= rowCount) return null
+
+	let rowColumnCounts = templatePlaceholderCells?.__meta?.rowColumnCounts
+	let targetRowCols = Number(Array.isArray(rowColumnCounts) ? rowColumnCounts[targetRow] : 0)
+	if (!Number.isFinite(targetRowCols) || columnIndex >= targetRowCols) return null
+
+	return { rowIndex: targetRow, columnIndex }
+}
+
+function buildTableCellTextRequests({ tableId, cell, text }) {
+	if (!tableId || !cell) return []
+	let normalized = replaceWithDefault(text)
+	return [
+		{
+			deleteText: {
+				objectId: tableId,
+				cellLocation: {
+					rowIndex: cell.rowIndex,
+					columnIndex: cell.columnIndex,
+				},
+				textRange: { type: 'ALL' },
+			},
+		},
+		{
+			insertText: {
+				objectId: tableId,
+				cellLocation: {
+					rowIndex: cell.rowIndex,
+					columnIndex: cell.columnIndex,
+				},
+				insertionIndex: 0,
+				text: normalized,
+			},
+		},
+		{
+			updateTextStyle: {
+				fields: 'link',
+				objectId: tableId,
+				cellLocation: {
+					rowIndex: cell.rowIndex,
+					columnIndex: cell.columnIndex,
+				},
+				textRange: { type: 'ALL' },
+				style: { link: null },
+			},
+		},
+	]
 }
 
 function isRateLimitError(e) {
@@ -581,9 +645,10 @@ export async function addSlide(event) {
   const linkUrl = event.usedUrl || event.directUrl || event.url || ''
   const titleWithSource = [title, linkUrl].filter(Boolean).join('\n')
   const videosPayload = parseVideoLinks(event.videoUrls)
-  const talkingPointsText = formatTalkingPointsForSlide(event.talkingPointsRu)
+  const talkingPointsText = formatTalkingPointsForSlide(event.arguments)
   const factsText = formatFactsForSlide(event.factsRu || event.notes)
-  const notesText = buildNotesText({ talkingPointsText, factsText })
+  const factsCellText = factsText ? `Факты:\n${factsText}` : ''
+  const argumentsCellText = talkingPointsText ? `Аргументы:\n${talkingPointsText}` : ''
 
   const replaceMap = buildReplaceMap({
     titleWithSource,
@@ -591,7 +656,6 @@ export async function addSlide(event) {
     videosText: videosPayload.text,
     sqk: event.sqk,
     priority: event.priority,
-    notesText,
   })
 
   // ??????????:
@@ -619,6 +683,8 @@ export async function addSlide(event) {
   }
   const titleCell = templatePlaceholderCells?.['{{title}}'] || null
   const videosCell = templatePlaceholderCells?.['{{videos}}'] || null
+  const factsCell = templatePlaceholderCells?.['{{notes}}'] || null
+  const argumentsCell = resolveArgumentsCell(templatePlaceholderCells)
   const titleLinkStart = title ? title.length + 1 : 0
   const titleLinkEnd = titleLinkStart + linkUrl.length
   const titleLinkRequest = buildCellLinkRequest({
@@ -633,6 +699,19 @@ export async function addSlide(event) {
     videosCell,
     links: videosPayload.links,
   })
+  const factsCellRequests = buildTableCellTextRequests({
+    tableId: newTableId,
+    cell: factsCell,
+    text: factsCellText,
+  })
+  const argumentsCellRequests = buildTableCellTextRequests({
+    tableId: newTableId,
+    cell: argumentsCell,
+    text: argumentsCellText,
+  })
+  if (!argumentsCell && argumentsCellText) {
+    log('SLIDES arguments cell not found; skipped arguments placement', `sqk=${event.sqk ?? ''}`)
+  }
 
   const requests = [
     {
@@ -666,6 +745,8 @@ export async function addSlide(event) {
     ...buildReplaceRequests(replaceMap, newSlideId),
 		...(titleLinkRequest ? [titleLinkRequest] : []),
 		...videoLinkRequests,
+		...factsCellRequests,
+		...argumentsCellRequests,
     {
       replaceAllText: {
         containsText: { text: `{{cat${event.topicId}_card${event.topicSqk}}}` },

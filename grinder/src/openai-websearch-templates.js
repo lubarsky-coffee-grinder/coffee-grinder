@@ -11,6 +11,7 @@ export function buildWebSearchWithTemperatureResponseBody({
 	user,
 	temperature,
 	webSearchOptions,
+	responseFormat,
 	reasoningEffort = 'low',
 }) {
 	let built = buildResponsesWebSearchRequest({
@@ -19,6 +20,7 @@ export function buildWebSearchWithTemperatureResponseBody({
 		user,
 		temperature,
 		webSearchOptions,
+		responseFormat,
 		reasoningEffort,
 	})
 	return built.request

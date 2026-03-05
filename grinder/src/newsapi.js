@@ -102,6 +102,31 @@ function pickFirstMeta(document, selectors) {
 	}
 }
 
+function pickPublishedAtFromDocument(document) {
+	let fromMeta = pickFirstMeta(document, [
+		['property', 'article:published_time'],
+		['property', 'article:modified_time'],
+		['property', 'og:published_time'],
+		['property', 'og:updated_time'],
+		['name', 'pubdate'],
+		['name', 'publish-date'],
+		['name', 'published_time'],
+		['name', 'date'],
+		['itemprop', 'datePublished'],
+		['itemprop', 'dateModified'],
+	])
+	let normalized = normalizePublishedAt(fromMeta)
+	if (normalized) return normalized
+
+	let timeNodes = document.querySelectorAll('time[datetime]')
+	for (let node of timeNodes || []) {
+		let value = node?.getAttribute?.('datetime')
+		let iso = normalizePublishedAt(value)
+		if (iso) return iso
+	}
+	return ''
+}
+
 function parseArticleFromHtml(html) {
 	let dom
 	try {
@@ -135,6 +160,7 @@ function parseArticleFromHtml(html) {
 
 	let articleNode = document.querySelector('article')
 	let rawText = htmlToText(articleNode ? articleNode.innerHTML : document.body?.innerHTML || html)
+	let publishedAt = pickPublishedAtFromDocument(document)
 
 	let text = `${title ? title + '\n\n' : ''}${desc ? desc + '\n\n' : ''}${rawText || ''}`
 	text = String(text || '').replace(/\n{3,}/g, '\n\n').trim()
@@ -143,6 +169,7 @@ function parseArticleFromHtml(html) {
 		title: title?.trim(),
 		body: text,
 		bodyHtml: articleNode ? articleNode.innerHTML : document.body?.innerHTML || html,
+		publishedAt,
 	}
 }
 
@@ -315,6 +342,7 @@ export async function extractArticleInfo(url) {
 			title: pickString(article, [['title'], ['info', 'title']]),
 			body: pickString(article, [['body'], ['bodyText'], ['content'], ['text']]),
 			bodyHtml: pickString(article, [['bodyHtml'], ['html'], ['contentHtml']]),
+			publishedAt: pickPublishedAt(article),
 		}
 		if (info?.bodyHtml && !info.body) {
 			try { info.body = htmlToText(info.bodyHtml) } catch {}
@@ -348,6 +376,7 @@ export async function extractArticleInfo(url) {
 				['article', 'html'],
 				['article', 'contentHtml'],
 			]),
+			publishedAt: pickPublishedAt(json),
 		}
 		if (info.bodyHtml && !info.body) {
 			try { info.body = htmlToText(info.bodyHtml) } catch {}

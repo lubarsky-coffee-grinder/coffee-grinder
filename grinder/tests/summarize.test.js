@@ -24,7 +24,11 @@ function cloneRows(rows) {
 	return JSON.parse(JSON.stringify(rows))
 }
 
-const newsRows = cloneRows(fixtureNews.rows ?? fixtureNews)
+const testIdPrefix = `test-${process.pid}-`
+const newsRows = cloneRows(fixtureNews.rows ?? fixtureNews).map((row, index) => ({
+	...row,
+	id: `${testIdPrefix}${row?.id ?? index + 1}`,
+}))
 const news = newsRows.map(row => ({ ...row }))
 
 const mod = relativePath => pathToFileURL(path.join(srcDir, relativePath)).href
@@ -179,7 +183,7 @@ test('summarize pipeline (mocked)', async () => {
 			)
 		}
 		assert.ok(updated.factsRu && String(updated.factsRu).length > 10, `Missing factsRu for id=${row.id}`)
-		assert.ok(updated.talkingPointsRu && String(updated.talkingPointsRu).length > 10, `Missing talkingPointsRu for id=${row.id}`)
+		assert.ok(updated.arguments && String(updated.arguments).length > 10, `Missing arguments for id=${row.id}`)
 		assert.ok(updated.videoUrls && String(updated.videoUrls).length > 10, `Missing videoUrls for id=${row.id}`)
 		assert.ok(updated.aiTopic, `Missing aiTopic for id=${row.id}`)
 		assert.ok(updated.aiPriority, `Missing aiPriority for id=${row.id}`)
