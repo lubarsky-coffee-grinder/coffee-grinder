@@ -400,6 +400,26 @@ const STOPWORDS = new Set([
 	'world', 'us', 'usa', 'uk', 'eu', 'article',
 ])
 
+const NOISY_KEYWORD_TOKENS = new Set([
+	'featured',
+	'independently',
+	'selected',
+	'editors',
+	'writers',
+	'preferred',
+	'source',
+	'sources',
+	'story',
+	'stories',
+	'google',
+	'endorse',
+	'worthwhile',
+	'something',
+	'products',
+	'cohost',
+	'welcomed',
+])
+
 function uniq(list) {
 	let seen = new Set()
 	let out = []
@@ -621,6 +641,7 @@ function tokenList(value) {
 		.map(v => v.trim())
 		.filter(v => Array.from(v).length >= 4)
 		.filter(v => !STOPWORDS.has(v))
+		.filter(v => !NOISY_KEYWORD_TOKENS.has(v))
 		.filter(v => !/^\d+$/.test(v))
 		// Drop long hash-like IDs from URLs (e.g. AP/Bloomberg slugs) to avoid noisy queries.
 		.filter(v => !/^[a-f0-9]{10,}$/i.test(v))
@@ -642,19 +663,26 @@ function hostTokens(url) {
 }
 
 function buildStoryKeywords({ titleEn, titleRu, url, text }) {
-	let list = [
+	let titleTokens = [
 		...tokenList(titleEn),
 		...tokenList(titleRu),
 	]
+	let pathTokens = []
+	try {
+		let path = new URL(String(url || '')).pathname
+		pathTokens = tokenList(path)
+	} catch {}
+
 	let lead = String(text || '')
 		.replace(/\s+/g, ' ')
 		.trim()
-		.slice(0, 350)
-	if (lead) list = list.concat(tokenList(lead).slice(0, 12))
-	try {
-		let path = new URL(String(url || '')).pathname
-		list = list.concat(tokenList(path))
-	} catch {}
+		.slice(0, 500)
+	let leadTokens = lead ? tokenList(lead) : []
+
+	// Query seeds should prioritize headline/URL entities over body boilerplate.
+	let base = uniq([...titleTokens, ...pathTokens])
+	let leadCap = base.length >= 4 ? 6 : 12
+	let list = uniq([...base, ...leadTokens.slice(0, leadCap)])
 
 	let banned = hostTokens(url)
 	if (banned.size) list = list.filter(v => !banned.has(v))
@@ -1096,9 +1124,10 @@ async function verifyVideoCandidatesRelevance({ story, candidate, candidateSnipp
 				{
 					role: 'system',
 					content: [
-						'You verify whether each linked YouTube video in candidate article is about the same event as the original story.',
-						'Allow wording differences and different editorial framing.',
-						'Set match=false for related but different events.',
+						'You verify whether each linked YouTube video can be used as B-roll/context for the original story.',
+						'Mark match=true when the video is either (A) the same event OR (B) close contextual coverage of the same topic/entities.',
+						'For case (B), keep confidence moderate (around 0.55-0.75).',
+						'Set match=false only when clearly unrelated.',
 						'Return one decision per videoUrl.',
 						'Return JSON only.',
 					].join(' '),
