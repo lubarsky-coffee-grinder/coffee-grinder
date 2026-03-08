@@ -950,6 +950,7 @@ export async function summarize() {
 		let sourceUrl = normalizeHttpUrl(e.url)
 		let previousUsedUrl = normalizeHttpUrl(e.usedUrl)
 		let needsAtStart = processingNeeds(e)
+		let triedDateRefresh = false
 
 		if (!sourceUrl /*&& !restricted.includes(e.source)*/) {
 			// Deprecated: gnUrl fallback exists only to support legacy rows without a direct article URL.
@@ -983,7 +984,6 @@ export async function summarize() {
 			if (cachedArticle?.agency) e.agency = cachedArticle.agency
 			if (cachedArticle?.publishedAt) e.date = normalizeRecentStoryDate(cachedArticle.publishedAt)
 			articleText = cachedArticle?.text || ''
-			if (!hasMeaningfulText(e.date)) await refreshStoryDate(e, sourceUrl)
 			if (articleText.length > MIN_TEXT_LENGTH) {
 				log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
 			}
@@ -1007,6 +1007,13 @@ export async function summarize() {
 			&& (articleText.length > MIN_TEXT_LENGTH || !needsTextWork)
 		if (shouldRefreshAgencyViaLookup) {
 			await refreshAgency(e, e.usedUrl || sourceUrl)
+		}
+		const shouldRefreshDateViaLookup = !!sourceUrl
+			&& !hasMeaningfulText(e.date)
+			&& (articleText.length > MIN_TEXT_LENGTH || !needsTextWork)
+		if (shouldRefreshDateViaLookup) {
+			triedDateRefresh = true
+			await refreshStoryDate(e, e.usedUrl || sourceUrl)
 		}
 		if (sourceUrl && needsTextWork && articleText.length <= MIN_TEXT_LENGTH) {
 			log('Extracting', e.source || '', 'article...', `url=${sourceUrl}`)
@@ -1056,7 +1063,10 @@ export async function summarize() {
 				}
 			}
 		}
-		if (!hasMeaningfulText(e.date) && sourceUrl) await refreshStoryDate(e, e.usedUrl || sourceUrl)
+		if (!hasMeaningfulText(e.date) && sourceUrl && !triedDateRefresh) {
+			triedDateRefresh = true
+			await refreshStoryDate(e, e.usedUrl || sourceUrl)
+		}
 
 		const currentNeeds = processingNeeds(e)
 		const forceSupportRefreshForNewSummary = articleText.length > MIN_TEXT_LENGTH
