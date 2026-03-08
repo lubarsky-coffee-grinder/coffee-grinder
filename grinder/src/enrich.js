@@ -16,11 +16,12 @@ const openai = new OpenAI()
 
 const DEFAULT_FACTS_MODEL = 'gpt-4o'
 const DEFAULT_TITLE_LOOKUP_MODEL = DEFAULT_FACTS_MODEL
-const L3_TALKING_POINTS_MODEL = 'gpt-5.2'
-const L3_TALKING_POINTS_REASONING_EFFORT = 'high'
-const L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE = 'medium'
-const L3_TALKING_POINTS_USER_LOCATION = { type: 'approximate' }
-const L3_TALKING_POINTS_VECTOR_STORE_IDS = ['vs_699e12566b64819196d2870def837004']
+const DEFAULT_ARGUMENTS_MODEL = 'gpt-5.2'
+const ARGUMENTS_LABEL = 'ARGUMENTS'
+const ARGUMENTS_REASONING_EFFORT = 'high'
+const ARGUMENTS_SEARCH_CONTEXT_SIZE = 'medium'
+const ARGUMENTS_USER_LOCATION = { type: 'approximate' }
+const ARGUMENTS_VECTOR_STORE_IDS = ['vs_699e12566b64819196d2870def837004']
 
 const FACTS_TEMPERATURE = 0
 const TITLE_LOOKUP_TEMPERATURE = 0
@@ -39,8 +40,72 @@ const titleLookupModelSource = explicitTitleLookupModel
 		? 'OPENAI_FACTS_MODEL'
 		: 'default'
 
-const talkingPointsModel = L3_TALKING_POINTS_MODEL
-const resolvedTalkingPointsVectorStoreIds = L3_TALKING_POINTS_VECTOR_STORE_IDS
+const explicitArgumentsModel = readEnv('OPENAI_ARGUMENTS_MODEL')
+const argumentsModel = explicitArgumentsModel || DEFAULT_ARGUMENTS_MODEL
+const argumentsModelSource = explicitArgumentsModel
+	? 'OPENAI_ARGUMENTS_MODEL'
+	: 'default'
+const resolvedArgumentsVectorStoreIds = ARGUMENTS_VECTOR_STORE_IDS
+
+const FACTS_RESPONSE_FORMAT = {
+	type: 'json_schema',
+	json_schema: {
+		name: 'news_facts',
+		schema: {
+			type: 'object',
+			additionalProperties: false,
+			properties: {
+				facts: {
+					type: 'array',
+					items: { type: 'string' },
+					minItems: 0,
+					maxItems: 12,
+				},
+			},
+			required: ['facts'],
+		},
+		strict: true,
+	},
+}
+
+const ARGUMENTS_RESPONSE_FORMAT = {
+	type: 'json_schema',
+	json_schema: {
+		name: 'news_arguments',
+		schema: {
+			type: 'object',
+			additionalProperties: false,
+			properties: {
+				arguments: {
+					type: 'array',
+					items: { type: 'string' },
+					minItems: 0,
+					maxItems: 5,
+				},
+			},
+			required: ['arguments'],
+		},
+		strict: true,
+	},
+}
+
+const TITLE_LOOKUP_RESPONSE_FORMAT = {
+	type: 'json_schema',
+	json_schema: {
+		name: 'title_lookup',
+		schema: {
+			type: 'object',
+			additionalProperties: false,
+			properties: {
+				titleEn: { type: 'string' },
+				titleRu: { type: 'string' },
+				extra: { type: 'string' },
+			},
+			required: ['titleEn', 'titleRu', 'extra'],
+		},
+		strict: true,
+	},
+}
 
 function webSearchOptions() {
 	let search_context_size = readEnv('OPENAI_WEBSEARCH_CONTEXT_SIZE')
@@ -76,14 +141,64 @@ function talkingPointsTools() {
 	return [
 		{
 			type: 'file_search',
-			vector_store_ids: resolvedTalkingPointsVectorStoreIds,
+			vector_store_ids: resolvedArgumentsVectorStoreIds,
 		},
 		{
 			type: 'web_search',
-			search_context_size: L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE,
-			user_location: L3_TALKING_POINTS_USER_LOCATION,
+			search_context_size: ARGUMENTS_SEARCH_CONTEXT_SIZE,
+			user_location: ARGUMENTS_USER_LOCATION,
 		},
 	]
+}
+
+function toResponsesTextFormat(responseFormat) {
+	let format = responseFormat
+	if (!format || typeof format !== 'object') return null
+	if (format.type !== 'json_schema' || !format.json_schema || typeof format.json_schema !== 'object') return null
+	let schema = format.json_schema
+	let name = String(schema.name || '').trim()
+	if (!name || !schema.schema || typeof schema.schema !== 'object') return null
+	return {
+		type: 'json_schema',
+		name,
+		schema: schema.schema,
+		strict: schema.strict !== false,
+	}
+}
+
+function extractJsonObjectFromText(value) {
+	let text = String(value || '').trim()
+	if (!text) return null
+
+	let candidate = text
+	let fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
+	if (fence?.[1]) candidate = fence[1].trim()
+	let objectMatch = candidate.match(/\{[\s\S]*\}/)
+	if (objectMatch) candidate = objectMatch[0]
+
+	try {
+		return JSON.parse(candidate)
+	} catch {
+		return null
+	}
+}
+
+function parseFactsOutput(raw) {
+	let parsed = extractJsonObjectFromText(raw)
+	if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.facts)) return String(raw || '').trim()
+	return parsed.facts
+		.map(v => String(v || '').trim())
+		.filter(Boolean)
+		.join('\n')
+}
+
+function parseArgumentsOutput(raw) {
+	let parsed = extractJsonObjectFromText(raw)
+	if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.arguments)) return String(raw || '').trim()
+	return parsed.arguments
+		.map(v => String(v || '').trim())
+		.filter(Boolean)
+		.join('\n\n')
 }
 
 export function describeFactsSettings() {
@@ -107,11 +222,12 @@ export function describeTitleLookupSettings() {
 }
 
 export function describeTalkingPointsSettings() {
-	let vectorStoreInfo = `vector_stores=${resolvedTalkingPointsVectorStoreIds.join(',')}`
-	return `api=responses tools=file_search,web_search model=${talkingPointsModel} store=true reasoning.effort=${L3_TALKING_POINTS_REASONING_EFFORT} web_search_context=${L3_TALKING_POINTS_SEARCH_CONTEXT_SIZE} user_location=approximate ${vectorStoreInfo}`
+	let src = argumentsModelSource ? ` (${argumentsModelSource})` : ''
+	let vectorStoreInfo = `vector_stores=${resolvedArgumentsVectorStoreIds.join(',')}`
+	return `api=responses tools=file_search,web_search model=${argumentsModel}${src} store=true reasoning.effort=${ARGUMENTS_REASONING_EFFORT} web_search_context=${ARGUMENTS_SEARCH_CONTEXT_SIZE} user_location=approximate ${vectorStoreInfo}`
 }
 
-async function responseWithWebSearch({ model, system, user, label, task, temperature, logger = log }) {
+async function responseWithWebSearch({ model, system, user, label, task, temperature, responseFormat, logger = log }) {
 	let opts = webSearchOptions()
 	try {
 		let body = buildWebSearchWithTemperatureResponseBody({
@@ -120,6 +236,7 @@ async function responseWithWebSearch({ model, system, user, label, task, tempera
 			user,
 			temperature,
 			webSearchOptions: opts,
+			responseFormat,
 			reasoningEffort: task === 'title_lookup'
 				? TITLE_LOOKUP_REASONING_EFFORT
 				: FACTS_REASONING_EFFORT,
@@ -151,6 +268,7 @@ async function responseWithTools({
 	task,
 	tools,
 	reasoningEffort = 'low',
+	responseFormat,
 	store = false,
 	logger = log,
 }) {
@@ -165,6 +283,8 @@ async function responseWithTools({
 			reasoning: { effort: reasoningEffort },
 		}
 		if (store) body.store = true
+		let textFormat = toResponsesTextFormat(responseFormat)
+		if (textFormat) body.text = { format: textFormat }
 		let res = await openai.post('/responses', { body })
 		estimateAndLogCost({
 			task,
@@ -188,32 +308,36 @@ export async function collectFacts({ titleEn, titleRu, text, url }, { logger = l
 	let prompt = await getPrompt(spreadsheetId, 'summarize:facts')
 	let title = titleRu || titleEn || ''
 	let input = `URL: ${url}\nTitle: ${title}\n\nArticle text:\n${text}`
-	return await responseWithWebSearch({
+	let raw = await responseWithWebSearch({
 		model: factsModel,
 		system: prompt,
 		user: input,
 		label: 'FACTS',
 		task: 'facts',
 		temperature: FACTS_TEMPERATURE,
+		responseFormat: FACTS_RESPONSE_FORMAT,
 		logger,
 	})
+	return parseFactsOutput(raw)
 }
 
 export async function collectTalkingPoints({ titleEn, titleRu, text, url }, { logger = log } = {}) {
-	let prompt = await getPrompt(spreadsheetId, 'summarize:talking-points')
+	let prompt = await getPrompt(spreadsheetId, 'summarize:arguments')
 	let title = titleRu || titleEn || ''
 	let input = `URL: ${url}\nTitle: ${title}\n\nArticle text:\n${text}`
-	return await responseWithTools({
-		model: talkingPointsModel,
+	let raw = await responseWithTools({
+		model: argumentsModel,
 		system: prompt,
 		user: input,
-		label: 'TALKING_POINTS',
+		label: ARGUMENTS_LABEL,
 		task: 'talking_points',
 		tools: talkingPointsTools(),
-		reasoningEffort: L3_TALKING_POINTS_REASONING_EFFORT,
+		reasoningEffort: ARGUMENTS_REASONING_EFFORT,
+		responseFormat: ARGUMENTS_RESPONSE_FORMAT,
 		store: true,
 		logger,
 	})
+	return parseArgumentsOutput(raw)
 }
 
 export async function collectVideos(
@@ -269,6 +393,7 @@ export async function collectTitleByUrl({ url }, { logger = log } = {}) {
 		label: 'TITLE_BY_URL',
 		task: 'title_lookup',
 		temperature: TITLE_LOOKUP_TEMPERATURE,
+		responseFormat: TITLE_LOOKUP_RESPONSE_FORMAT,
 		logger,
 	})
 	return parseStructuredTitleLookup(raw)

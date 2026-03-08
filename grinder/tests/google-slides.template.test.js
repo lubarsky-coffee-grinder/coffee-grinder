@@ -86,6 +86,12 @@ test('slides use configured template presentation and placeholders', async () =>
 															},
 														]
 													},
+													{
+														tableCells: [
+															{ text: { textElements: [] } },
+															{ text: { textElements: [] } },
+														]
+													},
 												]
 											}
 										},
@@ -117,13 +123,13 @@ test('slides use configured template presentation and placeholders', async () =>
 			summary: 'Test summary',
 			priority: 2,
 			url: 'https://example.com/article',
-			talkingPointsRu: [
-				'“Первый длинный заголовок в кавычках” Очень длинный первый talking point с дополнительными пояснениями и деталями для теста ограничения длины на слайде?',
+			arguments: [
+				'“Первый длинный заголовок в кавычках” Очень длинный первый talking point example.com/with-link с дополнительными пояснениями и деталями для теста ограничения длины на слайде?',
 				'“Второй длинный заголовок в кавычках” Ещё один длинный talking point с лишними словами, чтобы проверить автоматическое сжатие текста при вставке в notes?',
 				'“Третий длинный заголовок в кавычках” Третий пример для проверки лимита количества talking points в блоке на слайде?',
 				'“Четвертый длинный заголовок в кавычках” Этот пункт не должен попасть на слайд, потому что действует ограничение по количеству?',
 			].join('\n\n'),
-			factsRu: '- Тестовый факт',
+			factsRu: '- Тестовый факт || bad.example/fact-source',
 		})
 
 	// Assert template copy happened with the configured ID.
@@ -140,13 +146,30 @@ test('slides use configured template presentation and placeholders', async () =>
 	assert.ok(replaceReq, 'Expected replaceAllText for {{cat3_card1}}')
 	assert.match(String(replaceReq.replaceAllText?.replaceText), /^1\sTest title/)
 
-	const notesReq = batchCalls[0]?.requestBody?.requests?.find(
+	const notesReplaceReq = batchCalls[0]?.requestBody?.requests?.find(
 		r => r.replaceAllText?.containsText?.text === '{{notes}}'
 	)
-	assert.ok(notesReq, 'Expected replaceAllText for {{notes}}')
-	assert.match(String(notesReq.replaceAllText?.replaceText), /Talking points:/)
-	assert.match(String(notesReq.replaceAllText?.replaceText), /Факты:/)
-	const talkingBulletCount = (String(notesReq.replaceAllText?.replaceText).match(/^- /gm) || []).length
+	assert.equal(notesReplaceReq, undefined, 'Notes placeholder should be filled via direct cell update')
+
+	const factsInsertReq = batchCalls[0]?.requestBody?.requests?.find(
+		r => r.insertText?.cellLocation?.rowIndex === 1 && r.insertText?.cellLocation?.columnIndex === 1
+	)
+	assert.ok(factsInsertReq, 'Expected facts insert into {{notes}} cell')
+	const factsText = String(factsInsertReq.insertText?.text)
+	assert.match(factsText, /Факты:/)
+	assert.ok(!/https?:\/\/|www\./i.test(factsText), 'Facts cell must not contain URLs')
+	assert.ok(!/bad\.example/i.test(factsText), 'Facts cell must not contain bare domains')
+
+	const argsInsertReq = batchCalls[0]?.requestBody?.requests?.find(
+		r => r.insertText?.cellLocation?.rowIndex === 2 && r.insertText?.cellLocation?.columnIndex === 1
+	)
+	assert.ok(argsInsertReq, 'Expected arguments insert in next row cell')
+	const argsText = String(argsInsertReq.insertText?.text)
+	assert.match(argsText, /Аргументы:/)
+	assert.ok(!/https?:\/\/|www\./i.test(argsText), 'Arguments cell must not contain URLs')
+	assert.ok(!/example\.com/i.test(argsText), 'Arguments cell must not contain bare domains')
+
+	const talkingBulletCount = (argsText.match(/^- /gm) || []).length
 	assert.equal(talkingBulletCount, 4, 'Talking points on slide should keep all provided bullets')
 })
 

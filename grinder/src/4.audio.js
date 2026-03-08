@@ -49,11 +49,7 @@ export async function audio() {
 	if (liveFolderId) {
 		recordRunLink('audio_current', folderLink(liveFolderId))
 	}
-	log('Archiving current audio snapshot...')
-	let archiveSnapshotFolderId = await uploadFolder('../audio', archiveFolder, `${tag}_${audioFolderName}`, ['.mp3'])
-	if (archiveSnapshotFolderId) {
-		recordRunLink('archive_audio_snapshot', folderLink(archiveSnapshotFolderId))
-	}
+	log('Archive audio snapshot skipped (disabled to avoid duplicate uploads)')
 	log('Audio uploaded.')
 }
 

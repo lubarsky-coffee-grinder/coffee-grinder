@@ -85,6 +85,7 @@ Strict rules:
 – if a fact cannot be verified with high confidence, do not include it
 – avoid generalities and vague background
 – do NOT include any links or URLs
+– do NOT include domains, channel handles, or nicknames (example.com, t.me/name, @name)
 – output facts as text only
 
 Critical constraint:
@@ -100,7 +101,7 @@ output fewer bullets and clearly mark the list as:
 «Недостаточно надёжных дополняющих фактов».`,
 	},
 	{
-		name: 'summarize:talking-points',
+		name: 'summarize:arguments',
 		prompt: `You are Sergey Lyubarsky. Produce sharp, provocative analysis of the provided article.
 Output must be entirely in Russian.
 
@@ -133,10 +134,17 @@ Input:
 You will receive the full text of a news article (usually in English, sometimes in other languages).
 
 Task:
-Find exactly one relevant video link that can be used as B-roll or context for this specific story.
+Find the best direct YouTube video candidates that can be used as B-roll/context for this specific story.
+
+Search strategy:
+1) Extract high-signal entities from the article (who, organization, place, event type, date/time).
+2) Build focused queries from those entities (do not use generic words alone).
+3) Prioritize videos about the same event; if none, choose closest high-quality contextual videos.
+4) Prefer official media channels; if needed, expand beyond preferred list but keep quality high.
 
 Strict rules:
-- Return ONLY one YouTube link (\`youtube.com\` or \`youtu.be\`).
+- Return ONLY direct YouTube video links (youtube.com/watch?v=... or youtu.be/...).
+- Do not return non-video links (no channels/playlists/shorts pages).
 - Do not return links from any other domains.
 - Use only official news channels and major media organizations.
 - Completely exclude Al Jazeera channels (including Al Jazeera English/Arabic and any Al Jazeera branded channel).
@@ -145,13 +153,21 @@ Strict rules:
 - Prioritize YouTube uploads from those outlets/channels when available.
 - Avoid low-quality reposts, clickbait, sensationalism, and duplicates.
 - Do not invent links.
-- If no reliable non-excluded YouTube link exists, return an empty list.
+- If no reliable non-excluded YouTube links exist, return an empty array.
 
-Formatting:
-- Output only a bullet list.
-- One URL per bullet.
-- Return either exactly one bullet or an empty list.
-- No extra text.`,
+Output format:
+- Return ONLY JSON:
+{
+  "videos": [
+    {
+      "url": "https://www.youtube.com/watch?v=...",
+      "source": "Channel name",
+      "title": "Video title",
+      "publishedAt": "ISO-8601 or empty string"
+    }
+  ]
+}
+- No markdown, no comments, no extra keys, no prose.`,
 	},
 	{
 		name: 'summarize:fallback-keywords',

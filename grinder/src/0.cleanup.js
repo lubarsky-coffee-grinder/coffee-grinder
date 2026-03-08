@@ -1,10 +1,57 @@
-import { news, spreadsheetId } from './store.js'
+import { news, save } from './store.js'
 import { archivePresentation } from './google-slides.js'
 import { sleep } from './sleep.js'
 import { copyFile, getFile, moveFile } from './google-drive.js'
 import { rootFolderId, archiveFolderId, autoArchiveFolderId, audioFolderName, imageFolderName } from '../config/google-drive.js'
 import { log } from './log.js'
 import { recordRunLink, folderLink, presentationLink } from './run-links.js'
+
+const RESET_COLUMNS = [
+	'agency',
+	'factsRu',
+	'arguments',
+	'videoUrls',
+	'date',
+	'alternativeUrls',
+	'usedUrl',
+	'duplicateUrl',
+]
+
+function ensureColumns(table, cols) {
+	table.headers ||= []
+	for (let c of cols) {
+		if (!table.headers.includes(c)) table.headers.push(c)
+	}
+}
+
+function normalizeHeaders(table) {
+	table.headers ||= []
+	let normalized = []
+	let seen = new Set()
+	for (let raw of table.headers) {
+		let key = String(raw ?? '').trim()
+		if (!key) continue
+		// Deprecated: talkingPointsRu is a legacy alias; target column is arguments.
+		if (key === 'talkingPointsRu') key = 'arguments'
+		if (seen.has(key)) continue
+		seen.add(key)
+		normalized.push(key)
+	}
+	table.headers = normalized
+}
+
+async function clearNewsColumns() {
+	normalizeHeaders(news)
+	ensureColumns(news, RESET_COLUMNS)
+	for (let row of news || []) {
+		for (let col of RESET_COLUMNS) row[col] = ''
+		// Deprecated: keep clearing the old field while legacy rows may still contain it.
+		// One-time cleanup of old field if it still exists in sheet rows.
+		if (Object.prototype.hasOwnProperty.call(row, 'talkingPointsRu')) row.talkingPointsRu = ''
+	}
+	await save()
+	log('Cleanup: cleared table columns', RESET_COLUMNS.join(', '), `rows=${news.length}`)
+}
 
 function isAutoRun() {
 	return process.argv[2]?.endsWith('auto')
@@ -26,6 +73,7 @@ export async function cleanup() {
 	let name = runTag()
 	let archiveFolder = activeArchiveFolderId()
 	recordRunLink('archive_folder', folderLink(archiveFolder))
+	await clearNewsColumns()
 	//if (news.length) {
 	//	log('Archiving spreadsheet...')
 	//	await copyFile(spreadsheetId, archiveFolderId, name)
