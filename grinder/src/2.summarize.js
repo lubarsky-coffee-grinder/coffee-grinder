@@ -6,18 +6,18 @@ import { news, save } from './store.js'
 import { topics, topicsMap, normalizeTopic } from '../config/topics.js'
 // import { restricted } from '../config/agencies.js'
 import { decodeGoogleNewsUrl } from './google-news.js'
-import { extractArticleInfo, findAlternativeArticles } from './newsapi.js'
+import { extractArticleAgency, extractArticleDate, extractArticleInfo, findAlternativeArticles } from './newsapi.js'
 import { ai } from './ai.js'
 import { collectFacts, collectTalkingPoints, collectVideos, collectTitleByUrl, describeFactsSettings, describeTalkingPointsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
 import { extractFallbackKeywords, describeFallbackKeywordsSettings } from './fallback-keywords.js'
 import { logRunApiStats, logRunTotalCost } from './cost.js'
-import { ensureSummaryAttribution } from './summary-attribution.js'
+import { ensureSummaryAttribution, fallbackAgencyFromUrl, resolveSummaryAttributionSource } from './summary-attribution.js'
 
 const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
 const FALLBACK_MAX_KEYWORDS = 20
 const TALKING_POINTS_MAX_ITEMS = 5
-const FORCE_OVERWRITE_SUPPORT_FIELDS = !/^(0|false|no|off)$/i.test(String(process.env.SUMMARIZE_FORCE_OVERWRITE || '').trim())
+const STORY_DATE_RECENCY_DAYS = 5
 
 const STOPWORDS = new Set([
 	'the', 'and', 'for', 'with', 'from', 'that', 'this', 'these', 'those', 'into', 'over', 'under',
@@ -152,6 +152,7 @@ function migrateArgumentsColumn(table) {
 	for (let raw of table.headers) {
 		let key = String(raw ?? '').trim()
 		if (!key) continue
+		// Deprecated: talkingPointsRu is a legacy alias; target column is arguments.
 		if (key === 'talkingPointsRu') key = 'arguments'
 		if (seen.has(key)) continue
 		seen.add(key)
@@ -160,9 +161,11 @@ function migrateArgumentsColumn(table) {
 	table.headers = normalizedHeaders
 
 	for (let row of table || []) {
+		// Deprecated: talkingPointsRu is preserved here only for one-way migration into arguments.
 		let oldValue = String(row?.talkingPointsRu ?? '').trim()
 		let newValue = String(row?.arguments ?? '').trim()
 		if (oldValue && !newValue) row.arguments = oldValue
+		// Deprecated: drop the legacy alias once all rows are clean.
 		if (Object.prototype.hasOwnProperty.call(row, 'talkingPointsRu')) delete row.talkingPointsRu
 	}
 }
@@ -184,6 +187,66 @@ function normalizeDateIso(value) {
 	return Number.isFinite(normalized.getTime()) ? normalized.toISOString() : ''
 }
 
+function normalizeRecentStoryDate(value) {
+	let iso = normalizeDateIso(value)
+	if (!iso) return ''
+	let ms = new Date(iso).getTime()
+	if (!Number.isFinite(ms)) return ''
+	return Math.abs(ms - Date.now()) <= STORY_DATE_RECENCY_DAYS * 24 * 60 * 60e3 ? iso : ''
+}
+
+const URL_MONTH_NUMBERS = {
+	jan: 1,
+	january: 1,
+	feb: 2,
+	february: 2,
+	mar: 3,
+	march: 3,
+	apr: 4,
+	april: 4,
+	may: 5,
+	jun: 6,
+	june: 6,
+	jul: 7,
+	july: 7,
+	aug: 8,
+	august: 8,
+	sep: 9,
+	sept: 9,
+	september: 9,
+	oct: 10,
+	october: 10,
+	nov: 11,
+	november: 11,
+	dec: 12,
+	december: 12,
+}
+
+function monthNumberFromToken(token) {
+	let key = String(token ?? '').trim().toLowerCase()
+	return URL_MONTH_NUMBERS[key] || 0
+}
+
+function buildValidatedIsoDate(year, month, day = 1) {
+	let y = Number(year)
+	let m = Number(month)
+	let d = Number(day)
+	if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return ''
+	if (m < 1 || m > 12 || d < 1 || d > 31) return ''
+
+	let resolved = new Date(Date.UTC(y, m - 1, d))
+	if (!Number.isFinite(resolved.getTime())) return ''
+	if (resolved.getUTCFullYear() !== y || resolved.getUTCMonth() !== m - 1 || resolved.getUTCDate() !== d) return ''
+	return resolved.toISOString()
+}
+
+function hasResolvableAgencyInput(e) {
+	return !!(
+		normalizeHttpUrl(e?.usedUrl)
+		|| normalizeHttpUrl(e?.url)
+	)
+}
+
 function inferDateFromUrl(url) {
 	let normalizedUrl = normalizeHttpUrl(url)
 	if (!normalizedUrl) return ''
@@ -196,50 +259,63 @@ function inferDateFromUrl(url) {
 	}
 
 	let match = path.match(/(20\d{2})[\/._-](\d{1,2})[\/._-](\d{1,2})/)
-	if (!match) match = path.match(/\b(20\d{2})(\d{2})(\d{2})\b/)
-	if (!match) return ''
+	if (match) return buildValidatedIsoDate(match[1], match[2], match[3])
 
-	let year = Number(match[1])
-	let month = Number(match[2])
-	let day = Number(match[3])
-	if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return ''
-	if (month < 1 || month > 12 || day < 1 || day > 31) return ''
+	match = path.match(/\b(20\d{2})(\d{2})(\d{2})\b/)
+	if (match) return buildValidatedIsoDate(match[1], match[2], match[3])
 
-	let resolved = new Date(Date.UTC(year, month - 1, day))
-	if (!Number.isFinite(resolved.getTime())) return ''
-	if (resolved.getUTCFullYear() !== year || resolved.getUTCMonth() !== month - 1 || resolved.getUTCDate() !== day) return ''
-	return resolved.toISOString()
+	let namedMatch = path.match(/(?:^|[\/._-])(20\d{2})[\/._-]([a-z]{3,9})[\/._-](\d{1,2})(?:[\/._-]|$)/i)
+	if (namedMatch) {
+		let month = monthNumberFromToken(namedMatch[2])
+		if (month) return buildValidatedIsoDate(namedMatch[1], month, namedMatch[3])
+	}
+
+	return ''
 }
 
-function resolveStoryDate({ currentDate, sourceUrl, extractedPublishedAt }) {
-	return normalizeDateIso(extractedPublishedAt)
-		|| normalizeDateIso(currentDate)
-		|| inferDateFromUrl(sourceUrl)
+function resolveStoryDate({ sourceUrl, extractedPublishedAt }) {
+	return normalizeRecentStoryDate(extractedPublishedAt)
+		|| normalizeRecentStoryDate(inferDateFromUrl(sourceUrl))
 		|| ''
 }
 
-function readCachedArticleText(id, expectedUrl = '') {
+function readCachedArticle(id, expectedUrl = '') {
 	let key = String(id ?? '').trim()
-	if (!key) return ''
+	if (!key) return null
 	let file = `articles/${key}.txt`
-	if (!fs.existsSync(file)) return ''
+	if (!fs.existsSync(file)) return null
 	let raw = ''
 	try {
 		raw = String(fs.readFileSync(file, 'utf8') || '')
 	} catch {
-		return ''
+		return null
 	}
-	let match = raw.match(/^URL:\s*(.+?)\s*\n(?:Title:\s*.*\n)?\s*\n([\s\S]*)$/i)
-	if (!match?.[1] || !match?.[2]) return ''
+
+	let [header, ...rest] = raw.replace(/\r/g, '').split('\n\n')
+	if (!header || !rest.length) return null
+
+	let meta = {}
+	for (let line of header.split('\n')) {
+		let match = line.match(/^([A-Za-z]+):\s*(.*)$/)
+		if (!match) continue
+		meta[match[1]] = String(match[2] || '').trim()
+	}
+
+	let cacheUrl = normalizeHttpUrl(meta.URL || '')
+	let text = normalizeText(rest.join('\n\n'))
+	if (!cacheUrl || !text) return null
 
 	let expected = normalizeHttpUrl(expectedUrl || '')
-	let cacheUrl = normalizeHttpUrl(match[1])
-	if (!cacheUrl) return ''
-	if (expected && cacheUrl !== expected) return ''
+	if (expected && cacheUrl !== expected) return null
 
-	let text = normalizeText(match[2])
-	if (!text) return ''
-	return text.slice(0, MAX_TEXT_LENGTH)
+	return {
+		url: cacheUrl,
+		title: String(meta.Title || '').trim(),
+		agency: cleanAgencyName(meta.Agency || ''),
+		publishedAt: normalizeDateIso(meta.PublishedAt || ''),
+		eventUri: String(meta.EventUri || '').trim(),
+		text: text.slice(0, MAX_TEXT_LENGTH),
+	}
 }
 
 function hasMeaningfulText(value) {
@@ -433,7 +509,7 @@ function buildTalkingPointsInput({
 	titleRu,
 	summary,
 	factsRu,
-	source,
+	agency,
 	url,
 }) {
 	let fullText = String(articleText || '').trim()
@@ -441,7 +517,7 @@ function buildTalkingPointsInput({
 
 	let title = String(titleRu || titleEn || '').trim()
 	let summaryText = String(summary || '').trim()
-	let sourceText = String(source || '').trim()
+	let sourceText = String(agency || '').trim()
 	let urlText = String(url || '').trim()
 	let factsText = String(factsRu || '')
 		.replace(/\r/g, '\n')
@@ -461,6 +537,12 @@ function buildTalkingPointsInput({
 	if (urlText) chunks.push(`URL: ${urlText}`)
 
 	return chunks.join('\n\n').trim()
+}
+
+function cleanAgencyName(value) {
+	return String(value ?? '')
+		.replace(/\s+/g, ' ')
+		.trim()
 }
 
 function talkingPointsStats(value) {
@@ -499,9 +581,20 @@ function writeArticleCache(id, extracted, title = '') {
 	if (!key) return
 	fs.writeFileSync(`articles/${key}.html`, wrapHtml(extracted))
 	let cacheUrl = normalizeHttpUrl(extracted?.url || '')
+	let cacheAgency = cleanAgencyName(extracted?.source || '')
+	let cachePublishedAt = normalizeDateIso(extracted?.publishedAt || '')
+	let cacheEventUri = String(extracted?.eventUri || '').trim()
 	fs.writeFileSync(
 		`articles/${key}.txt`,
-		`URL: ${cacheUrl}\nTitle: ${title || ''}\n\n${extracted.text || ''}`
+		[
+			`URL: ${cacheUrl}`,
+			`Title: ${title || ''}`,
+			`Agency: ${cacheAgency}`,
+			`PublishedAt: ${cachePublishedAt}`,
+			`EventUri: ${cacheEventUri}`,
+			'',
+			String(extracted.text || ''),
+		].join('\n')
 	)
 }
 
@@ -518,8 +611,9 @@ async function forceRefreshArticleTextForFacts(e, sourceUrl) {
 	if (!extracted?.text) return ''
 
 	e.usedUrl = extracted.url || baseUrl
+	let refreshedAgency = cleanAgencyName(extracted.source)
+	if (refreshedAgency) e.agency = refreshedAgency
 	let refreshedDate = resolveStoryDate({
-		currentDate: e.date,
 		sourceUrl: e.usedUrl || baseUrl,
 		extractedPublishedAt: extracted.publishedAt,
 	})
@@ -529,16 +623,54 @@ async function forceRefreshArticleTextForFacts(e, sourceUrl) {
 	return extracted.text
 }
 
+async function refreshAgency(e, sourceUrl) {
+	let baseUrl = normalizeHttpUrl(sourceUrl || e.usedUrl || e.url)
+	if (!baseUrl) {
+		e.agency = ''
+		return ''
+	}
+
+	let agency = cleanAgencyName(await extractArticleAgency(baseUrl))
+	if (!agency) agency = cleanAgencyName(fallbackAgencyFromUrl(baseUrl))
+	e.agency = agency
+	if (agency) {
+		log('Agency resolved', agency, `url=${baseUrl}`)
+	} else {
+		log('Agency unresolved', `url=${baseUrl}`)
+	}
+	return agency
+}
+
+async function refreshStoryDate(e, sourceUrl) {
+	let baseUrl = normalizeHttpUrl(sourceUrl || e.usedUrl || e.url)
+	if (!baseUrl) {
+		e.date = ''
+		return ''
+	}
+
+	let storyDate = normalizeRecentStoryDate(await extractArticleDate(baseUrl))
+	if (!storyDate) storyDate = normalizeRecentStoryDate(inferDateFromUrl(baseUrl))
+	e.date = storyDate
+	if (storyDate) {
+		log('Date resolved', storyDate, `url=${baseUrl}`)
+	} else {
+		log('Date unresolved', `url=${baseUrl}`)
+	}
+	return storyDate
+}
+
 function processingNeeds(e) {
 	let needsSummary = !hasMeaningfulText(e.summary)
-	let needsFacts = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulFacts(e.factsRu)
-	let needsTalkingPoints = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulText(e.arguments)
-	let needsVideos = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasVideoLinks(e.videoUrls)
-	let needsDate = FORCE_OVERWRITE_SUPPORT_FIELDS || !hasMeaningfulText(e.date)
+	let needsFacts = !hasMeaningfulFacts(e.factsRu)
+	let needsTalkingPoints = !hasMeaningfulText(e.arguments)
+	let needsVideos = !hasVideoLinks(e.videoUrls)
+	let needsDate = !hasMeaningfulText(e.date)
 	let needsUsedUrl = !hasMeaningfulText(e.usedUrl)
+	let needsAgency = !hasMeaningfulText(e.agency) && hasResolvableAgencyInput(e)
 
 	let missing = []
 	if (needsSummary) missing.push('summary')
+	if (needsAgency) missing.push('agency')
 	if (needsFacts) missing.push('factsRu')
 	if (needsTalkingPoints) missing.push('arguments')
 	if (needsVideos) missing.push('videoUrls')
@@ -552,6 +684,7 @@ function processingNeeds(e) {
 		needsVideos,
 		needsDate,
 		needsUsedUrl,
+		needsAgency,
 		needsContent: needsSummary || needsFacts || needsTalkingPoints || needsVideos,
 		missing,
 	}
@@ -618,6 +751,8 @@ async function extractVerified(url) {
 				text: text.slice(0, MAX_TEXT_LENGTH),
 				html: info?.bodyHtml,
 				publishedAt,
+				source: cleanAgencyName(info?.source),
+				eventUri: String(info?.eventUri || '').trim(),
 			}
 		}
 		if (attempt === 0) log('No text extracted, retrying...')
@@ -629,6 +764,7 @@ async function decodeWithThrottle(last, gnUrl, label = 'Decoding URL...') {
 	last.urlDecode.delay += last.urlDecode.increment
 	last.urlDecode.time = Date.now()
 	log(label)
+	// Deprecated: gnUrl decode is kept only for legacy rows that still store Google News redirect URLs.
 	return await decodeGoogleNewsUrl(gnUrl)
 }
 
@@ -729,19 +865,23 @@ async function tryOtherAgencies(e, primaryUrl) {
 	}
 	if (best?.extracted) {
 		log('Fallback selected', best.source || '', `score=${best.score}`, `url=${best.url}`)
-		return best.extracted
+		return {
+			...best.extracted,
+			source: cleanAgencyName(best.extracted?.source || best.source),
+		}
 	}
 }
 
 export async function summarize() {
 	migrateArgumentsColumn(news)
-	ensureColumns(news, ['date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'arguments', 'videoUrls', 'duplicateUrl'])
+	ensureColumns(news, ['agency', 'date', 'url', 'usedUrl', 'alternativeUrls', 'factsRu', 'arguments', 'videoUrls', 'duplicateUrl'])
 
 	news.forEach((e, i) => e.id ||= i + 1)
 
 	let rows = news.map((e, rowIndex) => {
 		let decision = processingDecision(e)
 		let dedupeKey = normalizeHttpUrl(e.url || e.usedUrl)
+		// Deprecated: gnUrl remains only as a fallback dedupe key for legacy rows.
 		if (!dedupeKey && e.gnUrl) dedupeKey = String(e.gnUrl).trim()
 		return { e, rowIndex, dedupeKey, ...decision }
 	})
@@ -755,6 +895,7 @@ export async function summarize() {
 		let firstRunIndex = firstRunIndexByDedupeKey.get(row.dedupeKey)
 		if (firstRunIndex != null) {
 			row.skipReason = `duplicate_of_row=${firstRunIndex}`
+			row.e.agency = ''
 			row.e.factsRu = ''
 			row.e.arguments = ''
 			row.e.videoUrls = ''
@@ -765,7 +906,7 @@ export async function summarize() {
 	}
 	let list = runRows.filter(row => !row.skipReason)
 	let skipped = runRows.filter(row => !!row.skipReason)
-	log('SUMMARIZE_FORCE_OVERWRITE', FORCE_OVERWRITE_SUPPORT_FIELDS ? 'on' : 'off', 'dedupe=on', 'fields=factsRu,arguments,videoUrls,date')
+	log('SUMMARIZE_REFRESH', 'dedupe=on', 'always=agency,date')
 	log(
 		'SUMMARIZE_ROWS',
 		`total=${runRows.length}`,
@@ -808,15 +949,10 @@ export async function summarize() {
 		let articleText = ''
 		let sourceUrl = normalizeHttpUrl(e.url)
 		let previousUsedUrl = normalizeHttpUrl(e.usedUrl)
-		if (FORCE_OVERWRITE_SUPPORT_FIELDS) {
-			e.factsRu = ''
-			e.arguments = ''
-			e.videoUrls = ''
-			e.date = ''
-		}
 		let needsAtStart = processingNeeds(e)
 
 		if (!sourceUrl /*&& !restricted.includes(e.source)*/) {
+			// Deprecated: gnUrl fallback exists only to support legacy rows without a direct article URL.
 			if (!e.gnUrl) {
 				let canFallbackTalkingPointsOnly = needsAtStart.needsTalkingPoints
 					&& !needsAtStart.needsSummary
@@ -829,6 +965,7 @@ export async function summarize() {
 				}
 				log('No url/gnUrl, fallback to existing fields for talking points')
 			} else {
+				// Deprecated: gnUrl decode path exists only for legacy rows without a direct article URL.
 				sourceUrl = await decodeWithThrottle(last, e.gnUrl)
 				if (!sourceUrl) {
 					await sleep(5*60e3)
@@ -842,11 +979,11 @@ export async function summarize() {
 			// Always keep the actually used source URL:
 			// start with original URL, then overwrite with fallback URL if selected later.
 			e.usedUrl = sourceUrl
-			if (!hasMeaningfulText(e.date)) {
-				let inferredDate = inferDateFromUrl(sourceUrl)
-				if (inferredDate) e.date = inferredDate
-			}
-			articleText = readCachedArticleText(e.id, sourceUrl)
+			let cachedArticle = readCachedArticle(e.id, sourceUrl)
+			if (cachedArticle?.agency) e.agency = cachedArticle.agency
+			if (cachedArticle?.publishedAt) e.date = normalizeRecentStoryDate(cachedArticle.publishedAt)
+			articleText = cachedArticle?.text || ''
+			if (!hasMeaningfulText(e.date)) await refreshStoryDate(e, sourceUrl)
 			if (articleText.length > MIN_TEXT_LENGTH) {
 				log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
 			}
@@ -860,10 +997,17 @@ export async function summarize() {
 			e.arguments = ''
 			e.videoUrls = ''
 			e.date = ''
+			e.agency = ''
 		}
 
 		const initialNeeds = processingNeeds(e)
 		const needsTextWork = initialNeeds.needsContent
+		const shouldRefreshAgencyViaLookup = !!sourceUrl
+			&& !hasMeaningfulText(e.agency)
+			&& (articleText.length > MIN_TEXT_LENGTH || !needsTextWork)
+		if (shouldRefreshAgencyViaLookup) {
+			await refreshAgency(e, e.usedUrl || sourceUrl)
+		}
 		if (sourceUrl && needsTextWork && articleText.length <= MIN_TEXT_LENGTH) {
 			log('Extracting', e.source || '', 'article...', `url=${sourceUrl}`)
 			let extracted = await extractVerified(sourceUrl)
@@ -873,13 +1017,18 @@ export async function summarize() {
 			}
 			if (extracted) {
 				e.usedUrl = extracted.url || sourceUrl
+				let resolvedAgency = cleanAgencyName(extracted.source)
+				if (resolvedAgency) {
+					e.agency = resolvedAgency
+				} else {
+					await refreshAgency(e, e.usedUrl || sourceUrl)
+				}
 				let fallbackUsed = normalizeHttpUrl(e.usedUrl) && normalizeHttpUrl(sourceUrl) && normalizeHttpUrl(e.usedUrl) !== normalizeHttpUrl(sourceUrl)
 				if (fallbackUsed && extracted.title) {
 					e.titleEn = extracted.title
 					e.titleRu = ''
 				}
 				let resolvedDate = resolveStoryDate({
-					currentDate: e.date,
 					sourceUrl: e.usedUrl || sourceUrl,
 					extractedPublishedAt: extracted.publishedAt,
 				})
@@ -888,6 +1037,7 @@ export async function summarize() {
 				articleText = extracted.text
 				writeArticleCache(e.id, extracted, e.titleEn || e.titleRu || '')
 			} else {
+				await refreshAgency(e, e.usedUrl || sourceUrl)
 				log('Could not extract article text. Trying URL title lookup...', describeTitleLookupSettings())
 				try {
 					let lookedUp = await collectTitleByUrl({ url: e.usedUrl || sourceUrl || e.url })
@@ -906,10 +1056,7 @@ export async function summarize() {
 				}
 			}
 		}
-		if (!hasMeaningfulText(e.date) && sourceUrl) {
-			let inferredDate = inferDateFromUrl(e.usedUrl || sourceUrl)
-			if (inferredDate) e.date = inferredDate
-		}
+		if (!hasMeaningfulText(e.date) && sourceUrl) await refreshStoryDate(e, e.usedUrl || sourceUrl)
 
 		const currentNeeds = processingNeeds(e)
 		const forceSupportRefreshForNewSummary = articleText.length > MIN_TEXT_LENGTH
@@ -924,7 +1071,7 @@ export async function summarize() {
 			titleRu: e.titleRu,
 			summary: e.summary,
 			factsRu: forceSupportRefreshForNewSummary ? '' : e.factsRu,
-			source: e.source,
+			agency: resolveSummaryAttributionSource(e),
 			url: e.usedUrl || sourceUrl || e.url,
 		})
 		const shouldSummarize = articleText.length > 400 && currentNeeds.needsSummary
@@ -949,7 +1096,7 @@ export async function summarize() {
 						last.ai.time = Date.now()
 						return await ai({
 							url: e.usedUrl || sourceUrl || e.url,
-							source: e.source,
+							agency: resolveSummaryAttributionSource(e),
 							text: articleText,
 							logger: makeLogger(task),
 						})

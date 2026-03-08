@@ -1,3 +1,11 @@
+import { resolveAgencyFromUrl } from '../config/agencies.js'
+
+const ATTRIBUTION_TEMPLATES = [
+	source => `По данным ${source}.`,
+	source => `Об этом сообщает ${source}.`,
+	source => `Как пишет ${source}.`,
+]
+
 function cleanText(value) {
 	return String(value ?? '')
 		.replace(/\r/g, '')
@@ -10,14 +18,32 @@ function cleanSource(value) {
 		.trim()
 }
 
-function sourceFromUrl(value) {
-	if (!value) return ''
-	try {
-		let host = new URL(String(value).trim()).hostname.toLowerCase()
-		return host.replace(/^www\./, '')
-	} catch {
-		return ''
+export function fallbackAgencyFromUrl(value) {
+	return resolveAgencyFromUrl(value)
+}
+
+function stableHash(value) {
+	let text = String(value ?? '')
+	let hash = 0
+	for (let i = 0; i < text.length; i++) {
+		hash = (hash * 31 + text.charCodeAt(i)) >>> 0
 	}
+	return hash
+}
+
+function attributionVariants(source) {
+	return ATTRIBUTION_TEMPLATES.map(build => build(source))
+}
+
+function pickAttributionVariant(row, source) {
+	let seed = [
+		String(row?.id || '').trim(),
+		String(row?.usedUrl || '').trim(),
+		String(row?.url || '').trim(),
+		source,
+	].join('|')
+	let index = stableHash(seed) % ATTRIBUTION_TEMPLATES.length
+	return ATTRIBUTION_TEMPLATES[index](source)
 }
 
 function withTerminalPunctuation(summary) {
@@ -28,9 +54,7 @@ function withTerminalPunctuation(summary) {
 }
 
 export function resolveSummaryAttributionSource(row) {
-	let source = cleanSource(row?.source)
-	if (source) return source
-	return sourceFromUrl(row?.usedUrl || row?.url)
+	return cleanSource(row?.agency)
 }
 
 export function ensureSummaryAttribution(summary, row) {
@@ -40,8 +64,8 @@ export function ensureSummaryAttribution(summary, row) {
 	let source = resolveSummaryAttributionSource(row)
 	if (!source) return text
 
-	let canonicalAttribution = `По данным ${source}.`
-	if (text.endsWith(canonicalAttribution)) return text
+	let variants = attributionVariants(source)
+	if (variants.some(variant => text.endsWith(variant))) return text
 	let base = withTerminalPunctuation(text)
-	return `${base} ${canonicalAttribution}`
+	return `${base} ${pickAttributionVariant(row, source)}`
 }

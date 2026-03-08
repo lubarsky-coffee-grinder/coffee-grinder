@@ -7,6 +7,7 @@ import { log } from './log.js'
 import { recordRunLink, folderLink, presentationLink } from './run-links.js'
 
 const RESET_COLUMNS = [
+	'agency',
 	'factsRu',
 	'arguments',
 	'videoUrls',
@@ -30,6 +31,7 @@ function normalizeHeaders(table) {
 	for (let raw of table.headers) {
 		let key = String(raw ?? '').trim()
 		if (!key) continue
+		// Deprecated: talkingPointsRu is a legacy alias; target column is arguments.
 		if (key === 'talkingPointsRu') key = 'arguments'
 		if (seen.has(key)) continue
 		seen.add(key)
@@ -43,6 +45,7 @@ async function clearNewsColumns() {
 	ensureColumns(news, RESET_COLUMNS)
 	for (let row of news || []) {
 		for (let col of RESET_COLUMNS) row[col] = ''
+		// Deprecated: keep clearing the old field while legacy rows may still contain it.
 		// One-time cleanup of old field if it still exists in sheet rows.
 		if (Object.prototype.hasOwnProperty.call(row, 'talkingPointsRu')) row.talkingPointsRu = ''
 	}

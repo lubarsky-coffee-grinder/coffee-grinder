@@ -87,6 +87,18 @@ function pickPublishedAt(obj) {
 	return ''
 }
 
+function pickEventUri(obj) {
+	for (let path of [
+		['eventUri'],
+		['article', 'eventUri'],
+		['info', 'eventUri'],
+	]) {
+		let value = get(obj, path)
+		if (typeof value === 'string' && value.trim()) return value.trim()
+	}
+	return ''
+}
+
 function pickFirstMeta(document, selectors) {
 	for (let [nameAttr, contentAttr] of selectors) {
 		let metaSelectors = [
@@ -343,6 +355,8 @@ export async function extractArticleInfo(url) {
 			body: pickString(article, [['body'], ['bodyText'], ['content'], ['text']]),
 			bodyHtml: pickString(article, [['bodyHtml'], ['html'], ['contentHtml']]),
 			publishedAt: pickPublishedAt(article),
+			source: pickString(article, [['source', 'title'], ['info', 'source', 'title']]),
+			eventUri: pickEventUri(article),
 		}
 		if (info?.bodyHtml && !info.body) {
 			try { info.body = htmlToText(info.bodyHtml) } catch {}
@@ -377,6 +391,12 @@ export async function extractArticleInfo(url) {
 				['article', 'contentHtml'],
 			]),
 			publishedAt: pickPublishedAt(json),
+			source: pickString(json, [
+				['source', 'title'],
+				['article', 'source', 'title'],
+				['info', 'source', 'title'],
+			]),
+			eventUri: pickEventUri(json),
 		}
 		if (info.bodyHtml && !info.body) {
 			try { info.body = htmlToText(info.bodyHtml) } catch {}
@@ -387,12 +407,67 @@ export async function extractArticleInfo(url) {
 	let direct = await extractArticleDirectly(url)
 	if (direct?.body || direct?.title) {
 		log('newsapi.ai: extracted fallback from direct page for', url)
-		if (direct.body) return direct
+		if (direct.body) return { ...direct, source: direct?.source || '' }
 	}
 
 	// Only log on failure; success is already visible via extracted text length.
 	if (!uris.length) log('newsapi.ai: no indexed match for url:', url)
 	else log('newsapi.ai: indexed match has no body available for url:', url)
+}
+
+export async function extractArticleAgency(url) {
+	let apiKey = getApiKey()
+	if (!apiKey) return ''
+
+	let uris = await mapUrlToArticleUris(url)
+	if (uris.length) {
+		let info = await getArticleInfo(uris[0])
+		let agencyName = pickString(info, [['source', 'title'], ['info', 'source', 'title']])
+		if (agencyName) return agencyName
+
+		let article = await getArticleWithBody(uris[0])
+		agencyName = pickString(article, [['source', 'title'], ['info', 'source', 'title']])
+		if (agencyName) return agencyName
+	}
+
+	let json = await getJson(`${ER_ANALYTICS_BASE}/extractArticleInfo`, { apiKey, url })
+	if (json) {
+		let agencyName = pickString(json, [
+			['source', 'title'],
+			['article', 'source', 'title'],
+			['info', 'source', 'title'],
+		])
+		if (agencyName) return agencyName
+	}
+
+	let direct = await extractArticleDirectly(url)
+	return pickString(direct, [
+		['source'],
+		['source', 'title'],
+		['article', 'source'],
+		['article', 'source', 'title'],
+	])
+}
+
+export async function extractArticleDate(url) {
+	let apiKey = getApiKey()
+	if (!apiKey) return ''
+
+	let uris = await mapUrlToArticleUris(url)
+	if (uris.length) {
+		let info = await getArticleInfo(uris[0])
+		let publishedAt = pickPublishedAt(info)
+		if (publishedAt) return publishedAt
+	}
+
+	let json = await getJson(`${ER_ANALYTICS_BASE}/extractArticleInfo`, { apiKey, url })
+	if (json) {
+		let publishedAt = pickPublishedAt(json)
+		if (publishedAt) return publishedAt
+	}
+
+	let direct = await extractArticleDirectly(url)
+	return normalizePublishedAt(direct?.publishedAt)
 }
 
 async function mapUrlToArticleUris(articleUrl) {

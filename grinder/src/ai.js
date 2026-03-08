@@ -67,10 +67,10 @@ function withSummaryGuardrail(systemPrompt) {
 	return `${base}\n\n${SUMMARY_SOURCE_GUARDRAIL}`
 }
 
-async function chatSummarize({ url, text, source, logger = log }) {
+async function chatSummarize({ url, text, agency, logger = log }) {
 	let content = [
 		`URL: ${url}`,
-		`Source: ${String(source || '').trim()}`,
+		`Source: ${String(agency || '').trim()}`,
 		`Text:\n${text}`,
 	].join('\n')
 	let built = buildChatCompletionsRequest({
@@ -113,11 +113,11 @@ async function chatSummarize({ url, text, source, logger = log }) {
 	return parsed
 }
 
-export async function ai({ url, text, source, logger = log }) {
+export async function ai({ url, text, agency, logger = log }) {
 	await init
 
 	try {
-		let res = await chatSummarize({ url, text, source, logger })
+		let res = await chatSummarize({ url, text, agency, logger })
 		if (res) return res
 		logger('AI summarize: empty result')
 		return null

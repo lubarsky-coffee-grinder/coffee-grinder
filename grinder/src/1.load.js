@@ -17,12 +17,14 @@ function parse(xml) {
 			let json = xml2json(event.description?._text, { compact: true })
 			articles = JSON.parse(json).ol.li.map(({ a, font }) => ({
 				titleEn: a._text,
+				// Deprecated: gnUrl is a legacy Google News redirect URL kept only for old ingest flow.
 				gnUrl: a._attributes.href,
 				source: font._text,
 			}))
 		} catch(e) {}
 		return {
 			titleEn: event.title?._text, // .replace(` - ${event.source?._text}`, ''),
+			// Deprecated: gnUrl is a legacy Google News redirect URL kept only for old ingest flow.
 			gnUrl: event.link?._text,
 			source: event.source?._text,
 			date: new Date(event.pubDate._text),
@@ -36,6 +38,7 @@ function mergeInto(target, source) {
 	let index = {}
 	let seen = event => {
 		index[event.titleEn] = event
+		// Deprecated: gnUrl stays here only to dedupe legacy Google News-based rows.
 		index[event.gnUrl] = event
 	}
 	target.forEach(seen)
@@ -50,6 +53,7 @@ function intersect(target, source) {
 	let index = {}
 	let seen = event => {
 		index[event.titleEn] = event
+		// Deprecated: gnUrl stays here only to match legacy Google News-based rows.
 		index[event.gnUrl] = event
 	}
 	source.forEach(e => {

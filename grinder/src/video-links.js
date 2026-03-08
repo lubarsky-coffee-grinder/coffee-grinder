@@ -24,7 +24,7 @@ const YOUTUBE_RSS_RETRY_DELAY_MS = 1200
 const YOUTUBE_OEMBED_TIMEOUT_MS = 8e3
 const YOUTUBE_WATCH_TIMEOUT_MS = 10e3
 const PAGE_FETCH_TIMEOUT_MS = 10e3
-const DATE_WINDOW_DAYS = 3
+const DATE_WINDOW_DAYS = 5
 const FALLBACK_DATE_WINDOW_DAYS = 5
 const YOUTUBE_UPLOADS_DEFAULT = 150
 const YOUTUBE_UPLOADS_MIN = 100
@@ -44,7 +44,7 @@ const YOUTUBE_SEARCH_QUERIES_MAX = 6
 const DAY_MS = 24 * 60 * 60e3
 const MIN_KEYWORD_HITS = 1
 const VERIFY_SNIPPET_MAX_CHARS = 2500
-const VERIFY_MIN_CONFIDENCE = 0.55
+const VERIFY_MIN_CONFIDENCE = 0.7
 const VERIFY_TEMPERATURE = 0
 const VERIFY_REASONING_EFFORT = 'medium'
 const VIDEO_WEBSEARCH_REASONING_EFFORT = 'low'
@@ -552,20 +552,69 @@ function parseDateValue(value) {
 	return NaN
 }
 
+const URL_MONTH_NUMBERS = {
+	jan: 1,
+	january: 1,
+	feb: 2,
+	february: 2,
+	mar: 3,
+	march: 3,
+	apr: 4,
+	april: 4,
+	may: 5,
+	jun: 6,
+	june: 6,
+	jul: 7,
+	july: 7,
+	aug: 8,
+	august: 8,
+	sep: 9,
+	sept: 9,
+	september: 9,
+	oct: 10,
+	october: 10,
+	nov: 11,
+	november: 11,
+	dec: 12,
+	december: 12,
+}
+
+function monthNumberFromToken(token) {
+	let key = String(token ?? '').trim().toLowerCase()
+	return URL_MONTH_NUMBERS[key] || 0
+}
+
+function buildValidatedDateMs(year, month, day = 1) {
+	let y = Number(year)
+	let m = Number(month)
+	let d = Number(day)
+	if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return NaN
+	if (m < 1 || m > 12 || d < 1 || d > 31) return NaN
+
+	let resolved = new Date(Date.UTC(y, m - 1, d))
+	if (!Number.isFinite(resolved.getTime())) return NaN
+	if (resolved.getUTCFullYear() !== y || resolved.getUTCMonth() !== m - 1 || resolved.getUTCDate() !== d) return NaN
+	return resolved.getTime()
+}
+
 function parseDateFromUrl(value) {
 	let url = String(value || '')
 	if (!url) return NaN
 
-	let withDelimiters = url.match(/(?:\/|[-_])((?:19|20)\d{2})[-_/]((?:0[1-9]|1[0-2]))[-_/]((?:0[1-9]|[12]\d|3[01]))(?:\/|[-_]|$)/)
+	let withDelimiters = url.match(/(?:\/|[-_])((?:19|20)\d{2})[-_/]((?:0?[1-9]|1[0-2]))[-_/]((?:0?[1-9]|[12]\d|3[01]))(?:\/|[-_]|$)/)
 	if (withDelimiters) {
-		let d = new Date(`${withDelimiters[1]}-${withDelimiters[2]}-${withDelimiters[3]}T00:00:00Z`)
-		if (Number.isFinite(d.getTime())) return d.getTime()
+		return buildValidatedDateMs(withDelimiters[1], withDelimiters[2], withDelimiters[3])
 	}
 
 	let compact = url.match(/(?:\/|[-_])((?:19|20)\d{2})([01]\d)([0-3]\d)(?:\/|[-_]|$)/)
 	if (compact) {
-		let d = new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`)
-		if (Number.isFinite(d.getTime())) return d.getTime()
+		return buildValidatedDateMs(compact[1], compact[2], compact[3])
+	}
+
+	let withNamedMonth = url.match(/(?:\/|[-_])((?:19|20)\d{2})[-_/]([a-z]{3,9})[-_/]((?:0?[1-9]|[12]\d|3[01]))(?:\/|[-_]|$)/i)
+	if (withNamedMonth) {
+		let month = monthNumberFromToken(withNamedMonth[2])
+		if (month) return buildValidatedDateMs(withNamedMonth[1], month, withNamedMonth[3])
 	}
 
 	return NaN
@@ -583,6 +632,11 @@ function isWithinDateWindow(candidateMs, originMs, windowDays = DATE_WINDOW_DAYS
 	return Math.abs(candidateMs - originMs) <= windowDays * DAY_MS
 }
 
+function isRecentStoryDateMs(ms, windowDays = FALLBACK_DATE_WINDOW_DAYS) {
+	if (!Number.isFinite(ms)) return false
+	return Math.abs(ms - Date.now()) <= windowDays * DAY_MS
+}
+
 function formatGoogleDate(ms) {
 	let d = new Date(ms)
 	return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`
@@ -590,7 +644,9 @@ function formatGoogleDate(ms) {
 
 function buildDateWindowFromStory(story) {
 	let originMs = parseDateValue(story?.date)
+	if (!isRecentStoryDateMs(originMs)) originMs = NaN
 	if (!Number.isFinite(originMs)) originMs = parseDateFromUrl(story?.usedUrl || story?.url)
+	if (!isRecentStoryDateMs(originMs)) originMs = NaN
 	if (Number.isFinite(originMs)) {
 		return {
 			originMs,

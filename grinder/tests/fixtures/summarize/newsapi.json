@@ -1,14 +1,22 @@
 {
   "https://example.com/article-one": {
     "title": "Article One",
+    "source": "Mock Source",
+    "publishedAt": "2026-03-04T12:00:00.000Z",
+    "eventUri": "event-article-one",
     "body": "This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one. This is extracted text for article one."
   },
   "https://alt.example.com/article-one-alt": {
     "title": "Article One (Alt)",
+    "source": "Alt Agency",
+    "publishedAt": "2026-03-03T09:00:00.000Z",
+    "eventUri": "event-article-one",
     "body": "This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article. This is extracted text for the alt agency article."
   },
   "https://example.com/article-two": {
     "title": "Article Two",
+    "publishedAt": "2026-03-05T08:30:00.000Z",
+    "eventUri": "event-article-two",
     "body": "This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two. This is extracted text for article two."
   }
 }

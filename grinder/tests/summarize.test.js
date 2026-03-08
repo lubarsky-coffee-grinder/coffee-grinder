@@ -69,6 +69,8 @@ const extractCalls = new Map()
 const altCalls = new Map()
 mock.module(mod('newsapi.js'), {
 	namedExports: {
+		extractArticleAgency: async (url) => fixtureNewsApi[url]?.source || '',
+		extractArticleDate: async (url) => fixtureNewsApi[url]?.publishedAt || '',
 		extractArticleInfo: async (url) => {
 			extractCalls.set(url, (extractCalls.get(url) || 0) + 1)
 
@@ -175,11 +177,30 @@ test('summarize pipeline (mocked)', async () => {
 		const updated = byId.get(String(row.id))
 		assert.ok(updated, `Missing updated row for id=${row.id}`)
 		assert.ok(updated.summary && String(updated.summary).length > 10, `Missing summary for id=${row.id}`)
-		assert.match(String(updated.summary), /по данным/i, `Missing attribution phrase for id=${row.id}`)
+		assert.match(
+			String(updated.summary),
+			/(по данным|об этом сообщает|как пишет)/i,
+			`Missing attribution phrase for id=${row.id}`
+		)
+		if (updated.agency) {
+			assert.ok(
+				String(updated.summary).toLowerCase().includes(String(updated.agency).toLowerCase()),
+				`Missing agency label in summary for id=${row.id}`
+			)
+		}
+		if (String(row.gnUrl || '').includes('test-gn-1')) {
+			assert.equal(updated.agency, 'Alt Agency', `Unexpected fallback agency for id=${row.id}`)
+		}
+		if (String(row.url || '').includes('article-two')) {
+			assert.equal(updated.agency, 'example.com', `Expected domain fallback for id=${row.id}`)
+		}
+		if (row.agency) {
+			assert.notEqual(updated.agency, row.agency, `Agency should be overwritten for id=${row.id}`)
+		}
 		if (updated.source) {
 			assert.ok(
-				String(updated.summary).toLowerCase().includes(String(updated.source).toLowerCase()),
-				`Missing source label in summary for id=${row.id}`
+				!String(updated.summary).toLowerCase().includes(String(updated.source).toLowerCase()),
+				`Technical source leaked into summary attribution for id=${row.id}`
 			)
 		}
 		assert.ok(updated.factsRu && String(updated.factsRu).length > 10, `Missing factsRu for id=${row.id}`)
@@ -187,6 +208,8 @@ test('summarize pipeline (mocked)', async () => {
 		assert.ok(updated.videoUrls && String(updated.videoUrls).length > 10, `Missing videoUrls for id=${row.id}`)
 		assert.ok(updated.aiTopic, `Missing aiTopic for id=${row.id}`)
 		assert.ok(updated.aiPriority, `Missing aiPriority for id=${row.id}`)
+		assert.ok(updated.agency, `Missing agency for id=${row.id}`)
+		assert.ok(updated.date, `Missing date for id=${row.id}`)
 		if (row.gnUrl) {
 			assert.ok(updated.usedUrl, `Missing usedUrl for id=${row.id}`)
 		}
@@ -194,5 +217,9 @@ test('summarize pipeline (mocked)', async () => {
 		const txtPath = path.join(articlesDir, `${row.id}.txt`)
 		assert.ok(fs.existsSync(htmlPath), `Missing html output for id=${row.id}`)
 		assert.ok(fs.existsSync(txtPath), `Missing txt output for id=${row.id}`)
+		const txtContent = fs.readFileSync(txtPath, 'utf8')
+		assert.match(txtContent, /^Agency:\s+/m, `Missing cache agency metadata for id=${row.id}`)
+		assert.match(txtContent, /^PublishedAt:\s+/m, `Missing cache publishedAt metadata for id=${row.id}`)
+		assert.match(txtContent, /^EventUri:\s+/m, `Missing cache eventUri metadata for id=${row.id}`)
 	}
 })
