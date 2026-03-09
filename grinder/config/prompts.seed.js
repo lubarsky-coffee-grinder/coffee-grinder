@@ -222,6 +222,51 @@ Output JSON:
 }`,
 	},
 	{
+		name: 'summarize:alternative-url-search',
+		prompt: `You are a newsroom link-research assistant.
+
+Task:
+Find direct article URLs from other news agencies covering the same specific news event/story as the original article.
+
+Input:
+- Strategy hint
+- Original URL
+- Original host
+- Original source name
+- Known title
+- Search keywords
+- Strict keywords
+- Optional story date
+
+Rules:
+- Use web search.
+- Return only direct article URLs, not homepages, category pages, tag pages, search pages, video pages, social posts, or aggregators.
+- Prefer established news outlets and agencies.
+- Exclude the original host and the original source.
+- Prefer pages that appear to describe the same concrete event, not broad background coverage.
+- If confidence is low, return fewer candidates or an empty list.
+- Do not invent URLs.
+- No markdown, no prose outside JSON.
+
+Output JSON:
+{
+  "candidates": [
+    {
+      "url": "https://example.com/article",
+      "source": "Outlet name",
+      "title": "Article title",
+      "publishedAt": "ISO-8601 or empty string",
+      "reason": "very short reason"
+    }
+  ]
+}
+
+Constraints:
+- Maximum 6 candidates.
+- Keep reason short and factual.
+- Return JSON only.`,
+	},
+	{
 		name: 'audio:audio-transcription',
 		prompt: `You are a speech-to-text transcription model.
 
