@@ -86,19 +86,34 @@ Strict rules:
 – avoid generalities and vague background
 – do NOT include any links or URLs
 – do NOT include domains, channel handles, or nicknames (example.com, t.me/name, @name)
-– output facts as text only
+– do NOT include markdown links, citation brackets, or source tails like ([source](...)), (example.com), [example.com]
+- do NOT append source names in parentheses or at the end of a fact
+– the fact text field must contain plain text only, with no source tail
 
 Critical constraint:
 Only include external facts that are highly reliable, widely documented, and directly relevant to understanding this specific story.
 
 Formatting:
-– output only a bullet list
-– 8 to 12 bullet points
-– one fact per bullet
+– return ONLY valid JSON
+– no markdown, no prose, no bullet list
+– 8 to 12 facts when possible
+– one fact per item
+– each item must have:
+  - "fact": the Russian fact text only
+  - "sourceUrl": the supporting source URL, or empty string
 
 If you cannot find at least 8 reliable complementary facts,
-output fewer bullets and clearly mark the list as:
-«Недостаточно надёжных дополняющих фактов».`,
+return fewer items.
+
+Output JSON:
+{
+  "facts": [
+    {
+      "fact": "string",
+      "sourceUrl": "string"
+    }
+  ]
+}`,
 	},
 	{
 		name: 'summarize:arguments',

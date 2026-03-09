@@ -458,6 +458,26 @@ function hasMeaningfulFacts(value) {
 	return false
 }
 
+function stripFactSourceNoise(line) {
+	let text = String(line || '').trim()
+	if (!text) return ''
+
+	text = text
+		.replace(/\[[^\]]+\]\((?:https?:\/\/)?[^)\s]+[^)]*\)/gi, '')
+		.replace(/\(\s*\[[^\]]+\]\(\s*$/g, '')
+		.replace(/\[[^\]]+\]\(\s*$/g, '')
+		.replace(/\(\s*(?:https?:\/\/|www\.)[^)]*\)/gi, '')
+		.replace(/\(\s*[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s)]*)?\s*\)/gi, '')
+		.replace(/\s+\(?\[[a-z0-9.-]+\.[a-z]{2,}[^\]]*\]\(?\s*$/gi, '')
+		.replace(/\s+\(?@[\w.:-]+\)?\s*$/gi, '')
+		.replace(/\s+\(?(?:https?:\/\/|www\.)\S+\)?\s*$/gi, '')
+		.replace(/\s+\(?[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?\)?\s*$/gi, '')
+		.replace(/\s+/g, ' ')
+		.trim()
+
+	return /[\p{L}\p{N}]/u.test(text) ? text : ''
+}
+
 function normalizeFactsValue(value) {
 	let raw = String(value ?? '')
 		.replace(/\r/g, '')
@@ -478,7 +498,10 @@ function normalizeFactsValue(value) {
 			line = String(line.split('||')[0] ?? '').trim()
 		}
 		line = line
+			.replace(/\s*\|\|\s*.*$/g, '')
 			.replace(/https?:\/\/\S+/gi, '')
+		line = stripFactSourceNoise(line)
+		line = line
 			.replace(/\s+/g, ' ')
 			.trim()
 		if (!line) continue
@@ -683,11 +706,13 @@ async function refreshStoryDate(e, sourceUrl) {
 }
 
 function processingNeeds(e) {
+	let hasReadyTitle = hasMeaningfulText(e.titleEn) || hasMeaningfulText(e.titleRu)
+	let hasReadySummary = hasMeaningfulText(e.summary)
 	let needsTitleEn = !hasMeaningfulText(e.titleEn)
 	let needsSummary = !hasMeaningfulText(e.summary)
 	let needsFacts = !hasMeaningfulFacts(e.factsRu)
 	let needsTalkingPoints = !hasMeaningfulText(e.arguments)
-	let needsVideos = !hasVideoLinks(e.videoUrls)
+	let needsVideos = !hasVideoLinks(e.videoUrls) && !(hasReadyTitle && hasReadySummary)
 	let needsDate = !hasMeaningfulText(e.date)
 	let needsUsedUrl = !hasMeaningfulText(e.usedUrl)
 	let needsAgency = !hasMeaningfulText(e.agency) && hasResolvableAgencyInput(e)

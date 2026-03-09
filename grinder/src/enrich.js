@@ -30,6 +30,13 @@ const FACTS_TEMPERATURE = 0
 const TITLE_LOOKUP_TEMPERATURE = 0
 const FACTS_REASONING_EFFORT = 'low'
 const TITLE_LOOKUP_REASONING_EFFORT = 'low'
+const FACTS_SOURCE_GUARDRAIL = [
+	'CRITICAL: RETURN ONLY JSON MATCHING THE SUPPLIED SCHEMA.',
+	'EACH facts ITEM MUST BE AN OBJECT: {"fact":"...","sourceUrl":"..."}',
+	'PUT ONLY PLAIN RUSSIAN FACT TEXT INTO "fact".',
+	'NEVER include links, URLs, domains, markdown links, citation brackets, source names in parentheses, channel handles, or attribution tails inside "fact".',
+	'PUT THE DIRECT SOURCE LINK INTO "sourceUrl", OR AN EMPTY STRING IF UNAVAILABLE.',
+].join(' ')
 
 const explicitFactsModel = readEnv('OPENAI_FACTS_MODEL')
 const factsModel = explicitFactsModel || DEFAULT_FACTS_MODEL
@@ -66,7 +73,15 @@ const FACTS_RESPONSE_FORMAT = {
 			properties: {
 				facts: {
 					type: 'array',
-					items: { type: 'string' },
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						properties: {
+							fact: { type: 'string' },
+							sourceUrl: { type: 'string' },
+						},
+						required: ['fact', 'sourceUrl'],
+					},
 					minItems: 0,
 					maxItems: 12,
 				},
@@ -196,6 +211,13 @@ function formatWebSearchOptions(opts) {
 	return parts.length ? parts.join(' ') : 'context=default'
 }
 
+function withFactsGuardrail(systemPrompt) {
+	let base = String(systemPrompt || '').trim()
+	if (!base) return FACTS_SOURCE_GUARDRAIL
+	if (base.includes(FACTS_SOURCE_GUARDRAIL)) return base
+	return `${base}\n\n${FACTS_SOURCE_GUARDRAIL}`
+}
+
 function talkingPointsTools() {
 	return [
 		{
@@ -246,7 +268,10 @@ function parseFactsOutput(raw) {
 	let parsed = extractJsonObjectFromText(raw)
 	if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.facts)) return String(raw || '').trim()
 	return parsed.facts
-		.map(v => String(v || '').trim())
+		.map(item => {
+			if (item && typeof item === 'object' && !Array.isArray(item)) return String(item.fact || '').trim()
+			return String(item || '').trim()
+		})
 		.filter(Boolean)
 		.join('\n')
 }
@@ -386,7 +411,7 @@ export async function collectFacts({ titleEn, titleRu, text, url }, { logger = l
 	let input = `URL: ${url}\nTitle: ${title}\n\nArticle text:\n${text}`
 	let raw = await responseWithWebSearch({
 		model: factsModel,
-		system: prompt,
+		system: withFactsGuardrail(prompt),
 		user: input,
 		label: 'FACTS',
 		task: 'facts',

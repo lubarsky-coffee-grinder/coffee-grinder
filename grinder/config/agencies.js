@@ -45,6 +45,8 @@ export const agencyDomains = {
 	'Newsweek': ['newsweek.com'],
 	'Fortune': ['fortune.com'],
 	'The Hill': ['thehill.com'],
+	'New York Post': ['nypost.com'],
+	'Observer': ['observer.com'],
 	'MarketWatch': ['marketwatch.com'],
 	"Barron's": ['barrons.com'],
 	'ProPublica': ['propublica.org'],
