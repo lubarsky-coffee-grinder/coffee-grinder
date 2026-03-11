@@ -1,161 +1,249 @@
-# Coffee Grinder Pipeline Diagram (auto.bat oriented)
+# Coffee Grinder Pipeline Diagram (current state)
 
-## 1) Порядок шагов и суть выполнения
+## 1) Актуальный порядок шагов
 
-Важно: в текущем `auto.bat` шаг `npm run load auto` закомментирован, поэтому фактический auto-run идет без стадии `load`.
+Есть два практических режима запуска:
+
+- Ручной/операторский:
+  - `npm run presummarize`
+  - `npm run cleanup`
+  - `npm run load` при необходимости
+  - `npm run summarize`
+  - `npm run slides`
+  - `npm run screenshots`
+  - `npm run upload-img`
+  - `npm run audio`
+- Автоматический через `auto.bat`:
+  - `cleanup`
+  - локальная очистка `audio/*.mp3`, `img/*.jpg`, `img/screenshots.txt`, `articles/*.txt/html`
+  - `summarize`
+  - `slides`
+  - `screenshots`
+  - `upload-img`
+  - `audio`
+
+Важно:
+
+- `presummarize` сейчас не входит в `auto.bat`
+- `load auto` в `auto.bat` по-прежнему закомментирован
+- `presummarize` только досеивает отсутствующие prompt rows в таб `prompts`; существующие тексты prompt'ов он не перезаписывает
 
 ```mermaid
 flowchart TD
-    A["Start auto.bat"] --> B["cd grinder + fnm use 24 + npm i"]
+    A["Start"] --> B["optional: presummarize\nseed missing prompts only"]
     B --> C["cleanup (0.cleanup)"]
-    C --> D["Локальная очистка файлов:\naudio/*.mp3, img/*.jpg,\nimg/screenshots.txt, articles/*.txt/html"]
-    D --> E["summarize (2.summarize)\nобогащение news-строк"]
-    E --> F["slides (3.slides)\nсоздание/обновление deck + screenshots.txt"]
-    F --> G["screenshots\nрендер img/*.jpg по screenshots.txt"]
-    G --> H["upload-img\nархив старой live-папки + upload текущей live-папки"]
-    H --> I["audio (4.audio)\nTTS mp3 + архив старой live-папки + upload текущей live-папки"]
-    I --> J["RUN_COMPLETE + run-links logs"]
-
-    B -. optional/manual .-> L["load (1.load)\nGoogle News RSS ingest\n(сейчас отключён в auto.bat)"]
+    C --> D["archive previous deck/audio/img in Drive"]
+    D --> E["auto.bat only:\nlocal wipe audio/img/articles cache"]
+    E --> F["optional/manual: load (1.load)\nGoogle News ingest"]
+    F --> G["summarize (2.summarize)"]
+    G --> H["slides (3.slides)"]
+    H --> I["screenshots"]
+    I --> J["upload-img"]
+    J --> K["audio (4.audio)"]
 ```
 
-Кратко по шагам:
-- `cleanup`: очищает служебные колонки в `news`, сохраняет таблицу и архивирует предыдущую презентацию/папки `audio`/`img` в archive folder.
-- `summarize`: для строк из `news` решает, что надо достроить (`summary`, `agency`, `factsRu`, `arguments`, `videoUrls`, `date`, `usedUrl`), использует cache статьи, извлекает текст, затем запускает AI/видео-обогащение.
-- `slides`: формирует слайды, проставляет `sqk`, пишет `../img/screenshots.txt`, чистит незаполненные карточки.
-- `screenshots`: открывает URL, лечит overlay/paywall/consent/captcha сценарии (known fixes -> GPT vision -> Bright Data fallback), сохраняет `img/*.jpg`.
-- `upload-img`: архивирует предыдущую live-папку `img` в Drive и загружает текущую live-папку.
-- `audio`: генерирует mp3 через ElevenLabs, архивирует предыдущую live-папку `audio` и загружает текущую live-папку.
+## 2) Что реально делает `cleanup`
 
-## 2) Детальная схема `summarize`
+`cleanup` больше не чистит дополнительные колонки безусловно.
+
+Текущие правила для колонок:
+
+- если есть ссылка на статью и заполнены `title` + `summary`, дополнительные колонки сохраняются
+- если ссылки нет, дополнительные колонки очищаются
+- если одновременно пусты `title` и `summary`, дополнительные колонки очищаются
+- промежуточные строки не добиваются и не чистятся автоматически
+
+Под дополнительными колонками здесь понимаются:
+
+- `agency`
+- `factsRu`
+- `arguments`
+- `videoUrls`
+- `date`
+- `alternativeUrls`
+- `usedUrl`
+- `duplicateUrl`
+
+Дополнительно `cleanup`:
+
+- нормализует headers
+- чистит legacy-поле `talkingPointsRu`
+- архивирует предыдущую презентацию и live-папки `audio` / `img` в Google Drive
+
+## 3) Детальная схема `summarize`
 
 ```mermaid
 flowchart TD
-    S0["Row from news"] --> S1{"processingDecision:\ntopic != other?\nесть missing поля?"}
-    S1 -- "No" --> S1a["SKIP row"]
-    S1 -- "Yes" --> S2{"Есть sourceUrl?"}
+    S0["Row from news"] --> S1{"topic == other?"}
+    S1 -- "Yes" --> S1a["SKIP row"]
+    S1 -- "No" --> S2{"Есть missing поля?"}
+    S2 -- "No" --> S2a["SKIP already_complete"]
+    S2 -- "Yes" --> S3["processingNeeds:\ntitleEn, summary, agency,\nfactsRu, arguments, videoUrls,\ndate, usedUrl"]
 
-    S2 -- "No + gnUrl есть" --> S2a["decodeGoogleNewsUrl\n(throttle + retries)"]
-    S2a --> S2b{"Decode ok?"}
-    S2b -- "No" --> S2c["sleep 5 min + retry current row"]
-    S2b -- "Yes" --> S3
+    S3 --> S3a["Note:\nvideoUrls не считается missing,\nесли уже есть title + summary"]
+    S3a --> S4{"Есть прямой url?"}
 
-    S2 -- "No + gnUrl нет" --> S2d{"Можно дособрать только arguments\nиз существующих полей?"}
-    S2d -- "No" --> S2e["FAIL row"]
-    S2d -- "Yes" --> S6
-    S2 -- "Yes" --> S3["usedUrl = sourceUrl"]
+    S4 -- "No + gnUrl есть" --> S4a["decodeGoogleNewsUrl\n(throttle + retry loop)"]
+    S4a --> S5
+    S4 -- "No + gnUrl нет" --> S4b{"Можно собрать только arguments\nиз уже существующих полей?"}
+    S4b -- "No" --> S4c["FAIL row"]
+    S4b -- "Yes" --> S11
+    S4 -- "Yes" --> S5["sourceUrl ready"]
 
-    S3 --> S4{"Есть валидный cached article text?"}
-    S4 -- "Yes" --> S5["Подтянуть agency/date из cache\nпри наличии"]
-    S4 -- "No" --> S4a["extractVerified (2 attempts)"]
-    S4a --> S4b{"Extract ok?"}
-    S4b -- "No" --> S4c["tryOtherAgencies:\nkeywords -> fallback keywords AI ->\nfindAlternativeArticles -> relevance scoring"]
-    S4c --> S4d{"Fallback extract ok?"}
-    S4d -- "No" --> S4e["collectTitleByUrl (AI) as soft fallback"]
-    S4d -- "Yes" --> S5
-    S4b -- "Yes" --> S5
+    S5 --> S6{"Есть валидный articles cache?"}
+    S6 -- "Yes" --> S7["Reuse cached text/html/title/agency/date"]
+    S6 -- "No" --> S8{"Нужен article text?"}
+    S8 -- "No" --> S10
+    S8 -- "Yes" --> S9["Bright Data exact URL extract"]
+    S9 --> S9a{"Extract ok?"}
+    S9a -- "Yes" --> S10
+    S9a -- "No" --> S9b["tryOtherAgencies"]
 
-    S5 --> S5a{"agency/date пустые?"}
-    S5a -- "Yes" --> S5b["refreshAgency / refreshStoryDate\n(EventRegistry first, full date from URL fallback)"]
-    S5a -- "No" --> S6
-    S5b --> S6
+    S9b --> S9c["URL keywords\n-> fallback keywords AI\n-> GPT alternative URLs\n-> current direct flow\n-> EventRegistry/current alternatives"]
+    S9c --> S10
 
-    S6["Определяем needs:\nsummary / facts / arguments / videos"] --> S7["Run selected tasks in parallel"]
+    S7 --> S10["Backfill titleEn / agency / date"]
+    S10 --> S10a{"titleEn всё ещё пустой?"}
+    S10a -- "Yes" --> S10b["collectTitleByUrl via Responses API"]
+    S10a -- "No" --> S11
+    S10b --> S11
 
-    S7 --> S8{"facts содержит refusal marker?"}
-    S8 -- "Yes" --> S8a["forceRefreshArticleTextForFacts\n+ facts retry x1"]
-    S8a --> S9
-    S8 -- "No" --> S9["normalize + save outputs:\nsummary / factsRu / arguments / videoUrls"]
+    S11["Build currentNeeds"] --> S12["Run only needed tasks in parallel:\nsummary / facts / talking_points / videos"]
 
-    S9 --> S10["summary attribution autofix\nчерез agency"]
-    S10 --> S11["duplicate usedUrl marking\nsort + save sheet"]
+    S12 --> S13{"facts refusal marker?"}
+    S13 -- "Yes" --> S13a["forceRefreshArticleTextForFacts\n+ one facts retry"]
+    S13 -- "No" --> S14
+    S13a --> S14["normalize + save outputs"]
+
+    S14 --> S15["summary attribution autofix"]
+    S15 --> S16["duplicateUrl marking\nsort + save sheet"]
 ```
 
-## 3) 3rd-party сервисы, назначение и retry-политики
+### Что важно в текущей логике `summarize`
 
-| Сервис | Где используется | Для чего | Retry / attempts |
+- `titleEn` теперь считается частью `processingNeeds`
+- если пуст только `titleEn`, пайплайн не пересобирает `summary`, `facts`, `arguments`, `videos`
+- если пуст только `summary`, пайплайн не пересобирает уже заполненные `factsRu`, `arguments`, `videoUrls`
+- если у строки уже есть `title` и `summary`, повторная попытка найти `videoUrls` не делается
+- при смене `usedUrl` строка принудительно сбрасывает `summary`, `factsRu`, `arguments`, `videoUrls`, `date`, `agency`
+
+## 4) Что именно делают enrichment-ветки
+
+### Summary
+
+- генерируется через `src/ai.js`
+- результат: `titleRu`, `summary`, `topic`, `priority`
+- в конце `summary` всегда проходит через авто-атрибуцию по `agency`
+
+### Facts
+
+- вызываются через `src/enrich.js` -> `collectFacts`
+- идут через `Responses API` + `web_search`
+- модель теперь просится вернуть структурированный JSON:
+  - `facts: [{ fact, sourceUrl }]`
+- в таблицу записывается только `fact`
+- `sourceUrl` нужен как структурный выход модели, но в `factsRu` не сохраняется
+- пост-очистка хвостов и ссылок оставлена как guardrail
+
+### Talking points
+
+- вызываются через `src/enrich.js` -> `collectTalkingPoints`
+- идут через `Responses API` с `file_search + web_search`
+- сохраняются в `arguments`
+
+### Videos
+
+Текущая стратегия в `src/video-links.js`:
+
+1. exact article HTML -> поиск YouTube embed на самой странице статьи  
+2. YouTube API, если включён  
+3. YouTube RSS по trusted channels  
+4. YouTube/open search ветки  
+5. GPT web search  
+6. trusted page candidates через current flow / search fallbacks
+
+Дополнительные правила:
+
+- сначала используются original article title и URL slug, keywords только как fallback-сигнал
+- все кандидаты проходят relevance verify
+- перед выбором проверяется доступность ролика
+- недоступный ролик не блокирует дальнейший поиск альтернатив
+- сохраняются только прямые YouTube video URLs
+
+## 5) Текущие внешние сервисы и назначение
+
+| Сервис | Где используется | Для чего | Retry / notes |
 |---|---|---|---|
-| Google Sheets API | `store.js`, `prompts.js`, `screenshots.js` | Загрузка/сохранение `news`, `prompts`, лог фейлов скриншотов | Явных retry нет |
-| Google Slides API | `google-slides.js` | Создание/обновление презентации, очистка placeholders | `batchUpdateWithRetry`: до 6 попыток при 429, exponential backoff |
-| Google Drive API | `cleanup`, `upload-img`, `audio`, `google-slides` | Архивация и загрузка папок/файлов | Явных retry нет |
-| Google News (`news.google.com`) | `google-news.js` | Декодирование `gnUrl` в исходный URL статьи | До 5 попыток |
-| EventRegistry / newsapi.ai API | `newsapi.js` | `extractArticleInfo`, `extractArticleDate`, альтернативные статьи, дубликаты, события | Retry нет; timeout на запрос около 10s |
-| Прямой HTTP к статье | `fetch-article.js` | Фоллбек-извлечение HTML статьи | 2 попытки |
-| OpenAI Chat Completions | `ai.js`, `fallback-keywords.js`, `video-links.js`, `screenshots.js` | Summary, fallback keywords, video relevance verify, GPT vision action | Retry нет |
-| OpenAI Responses API | `enrich.js`, `video-links.js` | Facts / title lookup / arguments / GPT web-search for videos | Retry нет |
-| YouTube Data API v3 | `video-links.js` | Каналы/плейлисты/поиск видео | Transient retry x1 (429/5xx/timeout) |
-| YouTube RSS | `video-links.js` | Фоллбек получения свежих видео | feed/channel transient retry x1 |
-| SerpAPI | `video-links.js` | Поиск trusted page candidates | Retry x1 на transient/timeout; при 429 сервис отключается на run + cooldown |
-| Bright Data Web Unlocker | `brightdata-unlocker.js`, `screenshots.js` | Разблокировка HTML/скриншот-фоллбек для проблемных страниц | HTML: raw -> json fallback; screenshot: 2 попытки (30s -> 45s timeout) |
-| Playwright | `screenshots.js` | Рендер страниц и скриншоты | `safeEvaluate` до 3 попыток; known-fix passes = 2 |
-| ElevenLabs | `eleven.js` | Генерация mp3 озвучки | Retry нет (ошибка логируется, пайплайн продолжает) |
+| Google Sheets API | `store.js`, `prompts.js`, `screenshots.js` | `news`, `prompts`, screenshot logs | Явных retry почти нет |
+| Google Slides API | `google-slides.js` | deck creation/update | retry на `batchUpdate` при `429` |
+| Google Drive API | `cleanup`, `upload-img`, `audio`, `google-slides` | архив и upload папок/файлов | без выраженного retry-оркестратора |
+| Google News | `google-news.js` | decode `gnUrl` | до 5 попыток |
+| Bright Data SDK | `brightdata-unlocker.js`, `brightdata-article.js`, `screenshots.js` | exact article HTML, screenshot fallback | используется Web Unlocker / Scrape API; Crawling API не используется |
+| EventRegistry / newsapi.ai | `newsapi.js` | article info/date, current alternatives, event duplicates | остаётся как более поздний fallback |
+| OpenAI Chat Completions | `ai.js`, `screenshots.js` | summary, vision fallback | без общего retry-оркестратора |
+| OpenAI Responses API | `enrich.js`, `video-links.js` | facts, title lookup, arguments, alternative URL lookup, GPT video web search | без общего retry-оркестратора |
+| YouTube Data API | `video-links.js` | channel/video search | transient retry x1 |
+| YouTube RSS | `video-links.js` | latest channel videos | transient retry x1 |
+| SerpAPI | `video-links.js` | trusted page candidate lookup | retry x1; при `429` может отключаться на run |
+| Playwright | `screenshots.js` | render + screenshot | layered recovery logic |
+| ElevenLabs | `eleven.js` | TTS audio | per-row error does not kill full run |
 
-## 4) Валидаторы, фильтры и доп. обработка
+## 6) Валидаторы и фильтры
 
-| Блок | Что валидируется/фильтруется | Где |
+| Блок | Что сейчас проверяется | Где |
 |---|---|---|
-| Row gating | `topic=other` и полностью заполненные строки пропускаются | `2.summarize.js` (`processingDecision`) |
-| Dedup внутри run | Повторы по `url/usedUrl/gnUrl` пропускаются в текущем запуске | `2.summarize.js` |
-| Article cache | cache статьи принимается только если `URL` из cache совпадает с ожидаемым URL | `2.summarize.js` |
-| Date normalization | Приоритет: `publishedAt` из extract/EventRegistry -> полная дата из URL; только в окне `сегодня ±5d` | `2.summarize.js`, `video-links.js` |
-| Agency resolution | Сначала EventRegistry/source title, потом доменный mapper, потом hostname | `newsapi.js`, `summary-attribution.js`, `config/agencies.js` |
-| Facts normalization | Удаление буллетов, URL, `||source`, refusal marker | `2.summarize.js` |
-| Arguments normalization | Очистка форматирования + limit до 5 пунктов | `2.summarize.js` |
-| Video URL sanitizer | Сохраняются только прямые YouTube video URLs | `2.summarize.js`, `video-links.js` |
-| Summary attribution | Автодобавление финальной фразы через `agency` с несколькими формулировками | `summary-attribution.js` |
-| Duplicate URL marking | Группы дублей по `usedUrl/url` | `2.summarize.js`, `3.slides.js`, `screenshots.js` |
-| Topic normalization | Aliases/normalization для topic map | `config/topics.js`, `3.slides.js` |
-| Видео-кандидаты | trusted domains, date window, keyword hits, channel excludes/allowlist, verify confidence >= 0.70 | `video-links.js` |
-| Screenshot health checks | headline/source/overlay/captcha/paywall/content check + final quality checklist | `screenshots.js` |
-| Safety guard (vision) | GPT action whitelist и безопасные селекторы/тексты | `screenshots.js` |
+| Row gating | `topic=other`, `already_complete`, duplicate rows in current run | `2.summarize.js` |
+| Video refill gating | пустой `videoUrls` игнорируется для finished rows (`title + summary`) | `2.summarize.js` |
+| Cache reuse | cache принимается только если cache URL совпадает с ожидаемым URL | `2.summarize.js` |
+| Agency fallback | сначала extract/EventRegistry, потом domain mapper, потом raw hostname | `2.summarize.js`, `summary-attribution.js`, `config/agencies.js` |
+| Date normalization | `publishedAt`/extract/date lookup -> recent normalization | `2.summarize.js`, `video-links.js` |
+| Facts normalization | из результата вырезаются URL/citation tails/source noise | `2.summarize.js` |
+| Arguments normalization | приводятся к 5 блокам без мусорного форматирования | `2.summarize.js` |
+| Video candidate validation | trusted domains, allowlist/exclude, date window, relevance verify, availability check | `video-links.js` |
+| Summary attribution | финальная фраза добавляется автоматически через `agency` | `summary-attribution.js` |
+| Duplicate marking | группы дублей по `usedUrl/url` | `2.summarize.js`, `3.slides.js`, `screenshots.js` |
 
-## 5) Отсылки к промптам
+## 7) Промпты и где они живут
 
-Источник промптов: Google Sheet tab `prompts`; если строка отсутствует, автоматически seed из `grinder/config/prompts.seed.js`.
+Источник prompt'ов:
+
+- primary source at runtime: Google Sheet tab `prompts`
+- fallback seed source: `grinder/config/prompts.seed.js`
+
+`presummarize` только добавляет отсутствующие prompt names. Он не синхронизирует и не обновляет уже существующий текст.
 
 | Prompt name | Где вызывается | Назначение |
 |---|---|---|
-| `summarize:summary` | `src/ai.js` | Генерация `titleRu`, `summary`, `topic`, `priority` |
-| `summarize:facts` | `src/enrich.js` (`collectFacts`) | Дополняющие факты по статье |
-| `summarize:arguments` | `src/enrich.js` (`collectTalkingPoints`) | Аргументы / talking points для ведущего |
-| `summarize:videos` | `src/video-links.js` (`searchYoutubeVideosViaGptWebSearch`) | GPT web-search кандидатов видео |
-| `summarize:fallback-keywords` | `src/fallback-keywords.js` | AI-выбор fallback keywords |
-| `summarize:title-by-url` | `src/enrich.js` (`collectTitleByUrl`) | Получение заголовка по URL, если текст не извлечён |
+| `summarize:summary` | `src/ai.js` | `titleRu`, `summary`, `topic`, `priority` |
+| `summarize:facts` | `src/enrich.js` | facts JSON with `fact/sourceUrl` |
+| `summarize:arguments` | `src/enrich.js` | talking points |
+| `summarize:videos` | `src/video-links.js` | GPT web search video candidates |
+| `summarize:title-by-url` | `src/enrich.js` | `titleEn/titleRu` lookup by URL |
+| `summarize:fallback-keywords` | `src/fallback-keywords.js` | fallback keyword selection |
+| `summarize:alternative-url-search` | `src/enrich.js` | GPT lookup of alternative agency URLs |
 
-Inline prompts (не из Google Sheet):
-- GPT vision prompt в `src/screenshots.js` (`askVisionAction`).
-- Video verify prompt в `src/video-links.js` (`verifyVideoCandidatesRelevance`).
+Inline prompts:
 
-## 6) Решения после каждого этапа
+- video relevance verify prompt in `src/video-links.js`
+- GPT vision prompt in `src/screenshots.js`
+
+## 8) Что сохраняется после этапов
 
 - `cleanup`:
-  - очищает значения в служебных колонках `news`, но не удаляет строки;
-  - архивирует предыдущую презентацию и live-папки `audio` / `img`, если они существуют.
+  - приводит таблицу к чистому состоянию по текущим правилам
+  - архивирует прошлую презентацию и live-папки
 - `summarize`:
-  - по каждой строке: `skip` / `process` / `fail`;
-  - если меняется `usedUrl`, строка сбрасывается и пересобирается заново;
-  - при `facts refusal marker` выполняется принудительный re-extract + 1 retry facts;
-  - итог run: summary attribution autofix, duplicate marking, sort, save в Sheets, cost/api stats.
+  - обновляет только реально missing поля
+  - пишет/обновляет articles cache
+  - в конце проставляет `duplicateUrl`, сортирует и сохраняет sheet
 - `slides`:
-  - если презентации нет, создаётся копия из template;
-  - в deck идут только `topic != other` и `summary != empty`;
-  - для существующей презентации берутся только строки без `sqk`.
+  - создаёт/обновляет deck
+  - пишет `img/screenshots.txt`
 - `screenshots`:
-  - если `screenshots.txt` отсутствует, происходит graceful exit;
-  - если legacy файл без metadata и override не включён, будет hard error;
-  - по URL: `success/fail`; fail логируется в `screenshot_logs`.
+  - рендерит `img/*.jpg`
+  - логирует проблемные кадры
 - `upload-img`:
-  - архивируется старая live-папка `img`, затем загружается текущая live-папка.
+  - архивирует прошлую live image folder и загружает текущую
 - `audio`:
-  - берутся только строки с `sqk` и `summary`;
-  - ошибка TTS по отдельной строке не валит весь run;
-  - архивируется старая live-папка `audio`, затем загружается текущая live-папка.
-
-## 7) Что еще стоит добавить в схему
-
-Рекомендую добавить:
-1. `SLO/временные бюджеты` по стадиям (например p95 на `summarize`, `screenshots`).
-2. `Failure budget` и пороги алертов (процент fail screenshots, доля rows без summary).
-3. `Data contract` по обязательным колонкам Sheets (`news`, `prompts`, `screenshot_logs`).
-4. `Runbook` для типовых падений (Google auth, Bright Data limit, YouTube auth broken).
-5. `Idempotency notes` (что безопасно перезапускать и какие артефакты перезаписываются).
+  - генерирует mp3 для строк с `sqk + summary`
+  - архивирует прошлую live audio folder и загружает текущую

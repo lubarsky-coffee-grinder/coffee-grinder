@@ -17,16 +17,26 @@ const openai = new OpenAI()
 const DEFAULT_FACTS_MODEL = 'gpt-4o'
 const DEFAULT_TITLE_LOOKUP_MODEL = DEFAULT_FACTS_MODEL
 const DEFAULT_ARGUMENTS_MODEL = 'gpt-5.2'
+const DEFAULT_ALT_URL_MODEL = 'gpt-5.4'
 const ARGUMENTS_LABEL = 'ARGUMENTS'
 const ARGUMENTS_REASONING_EFFORT = 'high'
 const ARGUMENTS_SEARCH_CONTEXT_SIZE = 'medium'
 const ARGUMENTS_USER_LOCATION = { type: 'approximate' }
 const ARGUMENTS_VECTOR_STORE_IDS = ['vs_699e12566b64819196d2870def837004']
+const ALT_URL_REASONING_EFFORT = 'low'
+const ALT_URL_PARALLEL_REQUESTS = 3
 
 const FACTS_TEMPERATURE = 0
 const TITLE_LOOKUP_TEMPERATURE = 0
 const FACTS_REASONING_EFFORT = 'low'
 const TITLE_LOOKUP_REASONING_EFFORT = 'low'
+const FACTS_SOURCE_GUARDRAIL = [
+	'CRITICAL: RETURN ONLY JSON MATCHING THE SUPPLIED SCHEMA.',
+	'EACH facts ITEM MUST BE AN OBJECT: {"fact":"...","sourceUrl":"..."}',
+	'PUT ONLY PLAIN RUSSIAN FACT TEXT INTO "fact".',
+	'NEVER include links, URLs, domains, markdown links, citation brackets, source names in parentheses, channel handles, or attribution tails inside "fact".',
+	'PUT THE DIRECT SOURCE LINK INTO "sourceUrl", OR AN EMPTY STRING IF UNAVAILABLE.',
+].join(' ')
 
 const explicitFactsModel = readEnv('OPENAI_FACTS_MODEL')
 const factsModel = explicitFactsModel || DEFAULT_FACTS_MODEL
@@ -45,6 +55,12 @@ const argumentsModel = explicitArgumentsModel || DEFAULT_ARGUMENTS_MODEL
 const argumentsModelSource = explicitArgumentsModel
 	? 'OPENAI_ARGUMENTS_MODEL'
 	: 'default'
+
+const explicitAlternativeUrlModel = readEnv('OPENAI_ALTERNATIVE_NEWS_MODEL')
+const alternativeUrlModel = explicitAlternativeUrlModel || DEFAULT_ALT_URL_MODEL
+const alternativeUrlModelSource = explicitAlternativeUrlModel
+	? 'OPENAI_ALTERNATIVE_NEWS_MODEL'
+	: 'default'
 const resolvedArgumentsVectorStoreIds = ARGUMENTS_VECTOR_STORE_IDS
 
 const FACTS_RESPONSE_FORMAT = {
@@ -57,7 +73,15 @@ const FACTS_RESPONSE_FORMAT = {
 			properties: {
 				facts: {
 					type: 'array',
-					items: { type: 'string' },
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						properties: {
+							fact: { type: 'string' },
+							sourceUrl: { type: 'string' },
+						},
+						required: ['fact', 'sourceUrl'],
+					},
 					minItems: 0,
 					maxItems: 12,
 				},
@@ -107,6 +131,56 @@ const TITLE_LOOKUP_RESPONSE_FORMAT = {
 	},
 }
 
+const ALT_URL_RESPONSE_FORMAT = {
+	type: 'json_schema',
+	json_schema: {
+		name: 'alternative_url_search',
+		schema: {
+			type: 'object',
+			additionalProperties: false,
+			properties: {
+				candidates: {
+					type: 'array',
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						properties: {
+							url: { type: 'string' },
+							source: { type: 'string' },
+							title: { type: 'string' },
+							publishedAt: { type: 'string' },
+							reason: { type: 'string' },
+						},
+						required: ['url', 'source', 'title', 'publishedAt', 'reason'],
+					},
+					minItems: 0,
+					maxItems: 6,
+				},
+			},
+			required: ['candidates'],
+		},
+		strict: true,
+	},
+}
+
+function normalizeHttpUrl(value) {
+	try {
+		let url = new URL(String(value || '').trim())
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') return ''
+		return url.toString()
+	} catch {
+		return ''
+	}
+}
+
+function sourceFromUrl(value) {
+	try {
+		return new URL(String(value || '').trim()).hostname.toLowerCase().replace(/^www\./, '')
+	} catch {
+		return ''
+	}
+}
+
 function webSearchOptions() {
 	let search_context_size = readEnv('OPENAI_WEBSEARCH_CONTEXT_SIZE')
 	let country = readEnv('OPENAI_WEBSEARCH_COUNTRY')
@@ -135,6 +209,13 @@ function formatWebSearchOptions(opts) {
 	if (opts?.search_context_size) parts.push(`context=${opts.search_context_size}`)
 	if (opts?.user_location) parts.push(`location=${JSON.stringify(opts.user_location)}`)
 	return parts.length ? parts.join(' ') : 'context=default'
+}
+
+function withFactsGuardrail(systemPrompt) {
+	let base = String(systemPrompt || '').trim()
+	if (!base) return FACTS_SOURCE_GUARDRAIL
+	if (base.includes(FACTS_SOURCE_GUARDRAIL)) return base
+	return `${base}\n\n${FACTS_SOURCE_GUARDRAIL}`
 }
 
 function talkingPointsTools() {
@@ -187,7 +268,10 @@ function parseFactsOutput(raw) {
 	let parsed = extractJsonObjectFromText(raw)
 	if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.facts)) return String(raw || '').trim()
 	return parsed.facts
-		.map(v => String(v || '').trim())
+		.map(item => {
+			if (item && typeof item === 'object' && !Array.isArray(item)) return String(item.fact || '').trim()
+			return String(item || '').trim()
+		})
 		.filter(Boolean)
 		.join('\n')
 }
@@ -227,7 +311,22 @@ export function describeTalkingPointsSettings() {
 	return `api=responses tools=file_search,web_search model=${argumentsModel}${src} store=true reasoning.effort=${ARGUMENTS_REASONING_EFFORT} web_search_context=${ARGUMENTS_SEARCH_CONTEXT_SIZE} user_location=approximate ${vectorStoreInfo}`
 }
 
-async function responseWithWebSearch({ model, system, user, label, task, temperature, responseFormat, logger = log }) {
+export function describeAlternativeUrlLookupSettings() {
+	let src = alternativeUrlModelSource ? ` (${alternativeUrlModelSource})` : ''
+	return `api=responses tool=web_search model=${alternativeUrlModel}${src} parallel=${ALT_URL_PARALLEL_REQUESTS} reasoning.effort=${ALT_URL_REASONING_EFFORT} ${formatWebSearchOptions(webSearchOptions())}`
+}
+
+async function responseWithWebSearch({
+	model,
+	system,
+	user,
+	label,
+	task,
+	temperature,
+	responseFormat,
+	reasoningEffort,
+	logger = log,
+}) {
 	let opts = webSearchOptions()
 	try {
 		let body = buildWebSearchWithTemperatureResponseBody({
@@ -237,9 +336,11 @@ async function responseWithWebSearch({ model, system, user, label, task, tempera
 			temperature,
 			webSearchOptions: opts,
 			responseFormat,
-			reasoningEffort: task === 'title_lookup'
-				? TITLE_LOOKUP_REASONING_EFFORT
-				: FACTS_REASONING_EFFORT,
+			reasoningEffort: reasoningEffort || (
+				task === 'title_lookup'
+					? TITLE_LOOKUP_REASONING_EFFORT
+					: FACTS_REASONING_EFFORT
+			),
 		})
 		let res = await openai.post('/responses', { body })
 		estimateAndLogCost({
@@ -310,7 +411,7 @@ export async function collectFacts({ titleEn, titleRu, text, url }, { logger = l
 	let input = `URL: ${url}\nTitle: ${title}\n\nArticle text:\n${text}`
 	let raw = await responseWithWebSearch({
 		model: factsModel,
-		system: prompt,
+		system: withFactsGuardrail(prompt),
 		user: input,
 		label: 'FACTS',
 		task: 'facts',
@@ -341,13 +442,15 @@ export async function collectTalkingPoints({ titleEn, titleRu, text, url }, { lo
 }
 
 export async function collectVideos(
-	{ titleEn, titleRu, text, url, usedUrl, alternativeUrls, source, date },
+	{ titleEn, titleRu, articleTitle, text, html, url, usedUrl, alternativeUrls, source, date },
 	{ logger = log } = {}
 ) {
 	return await collectVideosFromTrustedSources({
 		titleEn,
 		titleRu,
+		articleTitle,
 		text,
+		html,
 		url,
 		usedUrl,
 		alternativeUrls,
@@ -383,6 +486,83 @@ function parseStructuredTitleLookup(raw) {
 	}
 }
 
+function parseAlternativeUrlCandidates(raw) {
+	let parsed = extractJsonObjectFromText(raw)
+	let items = Array.isArray(parsed?.candidates) ? parsed.candidates : []
+	let out = []
+	for (let item of items) {
+		let url = normalizeHttpUrl(item?.url)
+		if (!url) continue
+		out.push({
+			url,
+			source: String(item?.source || '').trim() || sourceFromUrl(url),
+			title: String(item?.title || '').trim(),
+			publishedAt: String(item?.publishedAt || '').trim(),
+			reason: String(item?.reason || '').trim(),
+		})
+	}
+	let seen = new Set()
+	return out.filter(item => {
+		if (seen.has(item.url)) return false
+		seen.add(item.url)
+		return true
+	})
+}
+
+function buildAlternativeUrlSearchInputs({ url, titleEn, titleRu, source, keywords, strictKeywords, date }) {
+	let title = String(titleRu || titleEn || '').trim()
+	let originalUrl = normalizeHttpUrl(url)
+	let originalHost = sourceFromUrl(originalUrl)
+	let originalSource = String(source || '').trim()
+	let keywordList = Array.isArray(keywords) ? keywords.map(v => String(v || '').trim()).filter(Boolean) : []
+	let strictList = Array.isArray(strictKeywords) ? strictKeywords.map(v => String(v || '').trim()).filter(Boolean) : []
+	let titleOrKeywords = title || keywordList.slice(0, 8).join(' ')
+
+	return [
+		{
+			name: 'exact_title',
+			user: [
+				'Strategy hint: exact_title',
+				`Original URL: ${originalUrl}`,
+				`Original host: ${originalHost}`,
+				`Original source name: ${originalSource}`,
+				`Known title: ${title}`,
+				`Search keywords: ${keywordList.join(', ')}`,
+				`Strict keywords: ${strictList.join(', ')}`,
+				`Story date: ${String(date || '').trim()}`,
+			].join('\n'),
+		},
+		{
+			name: 'strict_keywords',
+			user: [
+				'Strategy hint: strict_keywords',
+				`Original URL: ${originalUrl}`,
+				`Original host: ${originalHost}`,
+				`Original source name: ${originalSource}`,
+				`Known title: ${title}`,
+				`Search keywords: ${keywordList.join(', ')}`,
+				`Strict keywords: ${strictList.join(', ')}`,
+				`Story date: ${String(date || '').trim()}`,
+				`Search focus: ${strictList.slice(0, 6).join(' ') || titleOrKeywords}`,
+			].join('\n'),
+		},
+		{
+			name: 'url_context',
+			user: [
+				'Strategy hint: url_context',
+				`Original URL: ${originalUrl}`,
+				`Original host: ${originalHost}`,
+				`Original source name: ${originalSource}`,
+				`Known title: ${title}`,
+				`Search keywords: ${keywordList.join(', ')}`,
+				`Strict keywords: ${strictList.join(', ')}`,
+				`Story date: ${String(date || '').trim()}`,
+				`Search focus: ${titleOrKeywords}`,
+			].join('\n'),
+		},
+	].filter(item => String(item.user || '').trim())
+}
+
 export async function collectTitleByUrl({ url }, { logger = log } = {}) {
 	let prompt = await getPrompt(spreadsheetId, 'summarize:title-by-url')
 	let input = `URL: ${url}`
@@ -397,4 +577,61 @@ export async function collectTitleByUrl({ url }, { logger = log } = {}) {
 		logger,
 	})
 	return parseStructuredTitleLookup(raw)
+}
+
+export async function collectAlternativeUrlsByStory(
+	{ url, titleEn, titleRu, source, keywords, strictKeywords, date },
+	{ logger = log } = {}
+) {
+	let originalUrl = normalizeHttpUrl(url)
+	if (!originalUrl) return []
+
+	let prompt = await getPrompt(spreadsheetId, 'summarize:alternative-url-search')
+	let inputs = buildAlternativeUrlSearchInputs({
+		url: originalUrl,
+		titleEn,
+		titleRu,
+		source,
+		keywords,
+		strictKeywords,
+		date,
+	}).slice(0, ALT_URL_PARALLEL_REQUESTS)
+
+	if (!inputs.length) return []
+
+	let results = await Promise.allSettled(inputs.map(async item => {
+		let raw = await responseWithWebSearch({
+			model: alternativeUrlModel,
+			system: prompt,
+			user: item.user,
+			label: `ALT_URL_${item.name}`,
+			task: 'alternative_url_lookup',
+			responseFormat: ALT_URL_RESPONSE_FORMAT,
+			reasoningEffort: ALT_URL_REASONING_EFFORT,
+			logger,
+		})
+		let candidates = parseAlternativeUrlCandidates(raw)
+		logger('ALT_URL_LOOKUP', `strategy=${item.name}`, `candidates=${candidates.length}`)
+		return candidates.map(candidate => ({ ...candidate, strategy: item.name }))
+	}))
+
+	let seen = new Set()
+	let out = []
+	for (let result of results) {
+		if (result.status !== 'fulfilled') continue
+		for (let candidate of result.value || []) {
+			let url = normalizeHttpUrl(candidate?.url)
+			if (!url || url === originalUrl || seen.has(url)) continue
+			seen.add(url)
+			out.push({
+				url,
+				source: String(candidate?.source || '').trim() || sourceFromUrl(url),
+				title: String(candidate?.title || '').trim(),
+				publishedAt: String(candidate?.publishedAt || '').trim(),
+				reason: String(candidate?.reason || '').trim(),
+				strategy: String(candidate?.strategy || '').trim(),
+			})
+		}
+	}
+	return out
 }

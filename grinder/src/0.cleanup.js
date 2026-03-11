@@ -17,6 +17,37 @@ const RESET_COLUMNS = [
 	'duplicateUrl',
 ]
 
+function hasMeaningfulText(value) {
+	return String(value ?? '').trim().length > 0
+}
+
+function hasTitle(row) {
+	return hasMeaningfulText(row?.titleRu) || hasMeaningfulText(row?.titleEn)
+}
+
+function hasArticleLink(row) {
+	return hasMeaningfulText(row?.url) || hasMeaningfulText(row?.gnUrl)
+}
+
+function hasResetColumnValues(row) {
+	if ((RESET_COLUMNS || []).some(col => hasMeaningfulText(row?.[col]))) return true
+	return hasMeaningfulText(row?.talkingPointsRu)
+}
+
+function hasSummary(row) {
+	return hasMeaningfulText(row?.summary)
+}
+
+function shouldPreserveResetColumns(row) {
+	return hasArticleLink(row) && hasTitle(row) && hasSummary(row)
+}
+
+function shouldClearResetColumns(row) {
+	if (!hasArticleLink(row)) return true
+	if (!hasSummary(row) && !hasTitle(row)) return true
+	return false
+}
+
 function ensureColumns(table, cols) {
 	table.headers ||= []
 	for (let c of cols) {
@@ -43,14 +74,45 @@ function normalizeHeaders(table) {
 async function clearNewsColumns() {
 	normalizeHeaders(news)
 	ensureColumns(news, RESET_COLUMNS)
+	let stats = {
+		cleared: 0,
+		preserved: 0,
+		untouchedPartial: 0,
+		clearedMissingLink: 0,
+		clearedMissingTitleAndSummary: 0,
+	}
 	for (let row of news || []) {
-		for (let col of RESET_COLUMNS) row[col] = ''
+		let hasExtraValues = hasResetColumnValues(row)
+		let shouldPreserve = shouldPreserveResetColumns(row)
+		let shouldClear = shouldClearResetColumns(row)
+		if (hasExtraValues && shouldPreserve) {
+			stats.preserved++
+		} else if (hasExtraValues && shouldClear) {
+			for (let col of RESET_COLUMNS) row[col] = ''
+			stats.cleared++
+			if (!hasArticleLink(row)) {
+				stats.clearedMissingLink++
+			} else {
+				stats.clearedMissingTitleAndSummary++
+			}
+		} else if (hasExtraValues) {
+			stats.untouchedPartial++
+		}
 		// Deprecated: keep clearing the old field while legacy rows may still contain it.
 		// One-time cleanup of old field if it still exists in sheet rows.
 		if (Object.prototype.hasOwnProperty.call(row, 'talkingPointsRu')) row.talkingPointsRu = ''
 	}
 	await save()
-	log('Cleanup: cleared table columns', RESET_COLUMNS.join(', '), `rows=${news.length}`)
+	log(
+		'Cleanup: reconciled table columns',
+		RESET_COLUMNS.join(', '),
+			`rows=${news.length}`,
+			`preserved=${stats.preserved}`,
+			`untouched_partial=${stats.untouchedPartial}`,
+			`cleared=${stats.cleared}`,
+			`cleared_missing_link=${stats.clearedMissingLink}`,
+			`cleared_missing_title_and_summary=${stats.clearedMissingTitleAndSummary}`,
+		)
 }
 
 function isAutoRun() {

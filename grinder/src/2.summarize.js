@@ -8,10 +8,22 @@ import { topics, topicsMap, normalizeTopic } from '../config/topics.js'
 import { decodeGoogleNewsUrl } from './google-news.js'
 import { extractArticleAgency, extractArticleDate, extractArticleInfo, findAlternativeArticles } from './newsapi.js'
 import { ai } from './ai.js'
-import { collectFacts, collectTalkingPoints, collectVideos, collectTitleByUrl, describeFactsSettings, describeTalkingPointsSettings, describeVideosSettings, describeTitleLookupSettings } from './enrich.js'
+import {
+	collectAlternativeUrlsByStory,
+	collectFacts,
+	collectTalkingPoints,
+	collectVideos,
+	collectTitleByUrl,
+	describeAlternativeUrlLookupSettings,
+	describeFactsSettings,
+	describeTalkingPointsSettings,
+	describeVideosSettings,
+	describeTitleLookupSettings,
+} from './enrich.js'
 import { extractFallbackKeywords, describeFallbackKeywordsSettings } from './fallback-keywords.js'
 import { logRunApiStats, logRunTotalCost } from './cost.js'
 import { ensureSummaryAttribution, fallbackAgencyFromUrl, resolveSummaryAttributionSource } from './summary-attribution.js'
+import { describeBrightDataArticleExtractionSettings, extractArticleWithBrightData } from './brightdata-article.js'
 
 const MIN_TEXT_LENGTH = 400
 const MAX_TEXT_LENGTH = 30000
@@ -308,12 +320,23 @@ function readCachedArticle(id, expectedUrl = '') {
 	let expected = normalizeHttpUrl(expectedUrl || '')
 	if (expected && cacheUrl !== expected) return null
 
+	let html = ''
+	let htmlFile = `articles/${key}.html`
+	if (fs.existsSync(htmlFile)) {
+		try {
+			let rawHtml = String(fs.readFileSync(htmlFile, 'utf8') || '')
+			let match = rawHtml.match(/^<!--\s*\n[\s\S]*?\n-->\n?([\s\S]*)$/)
+			html = String(match?.[1] || '').trim()
+		} catch {}
+	}
+
 	return {
 		url: cacheUrl,
 		title: String(meta.Title || '').trim(),
 		agency: cleanAgencyName(meta.Agency || ''),
 		publishedAt: normalizeDateIso(meta.PublishedAt || ''),
 		eventUri: String(meta.EventUri || '').trim(),
+		html,
 		text: text.slice(0, MAX_TEXT_LENGTH),
 	}
 }
@@ -435,6 +458,26 @@ function hasMeaningfulFacts(value) {
 	return false
 }
 
+function stripFactSourceNoise(line) {
+	let text = String(line || '').trim()
+	if (!text) return ''
+
+	text = text
+		.replace(/\[[^\]]+\]\((?:https?:\/\/)?[^)\s]+[^)]*\)/gi, '')
+		.replace(/\(\s*\[[^\]]+\]\(\s*$/g, '')
+		.replace(/\[[^\]]+\]\(\s*$/g, '')
+		.replace(/\(\s*(?:https?:\/\/|www\.)[^)]*\)/gi, '')
+		.replace(/\(\s*[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s)]*)?\s*\)/gi, '')
+		.replace(/\s+\(?\[[a-z0-9.-]+\.[a-z]{2,}[^\]]*\]\(?\s*$/gi, '')
+		.replace(/\s+\(?@[\w.:-]+\)?\s*$/gi, '')
+		.replace(/\s+\(?(?:https?:\/\/|www\.)\S+\)?\s*$/gi, '')
+		.replace(/\s+\(?[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?\)?\s*$/gi, '')
+		.replace(/\s+/g, ' ')
+		.trim()
+
+	return /[\p{L}\p{N}]/u.test(text) ? text : ''
+}
+
 function normalizeFactsValue(value) {
 	let raw = String(value ?? '')
 		.replace(/\r/g, '')
@@ -455,7 +498,10 @@ function normalizeFactsValue(value) {
 			line = String(line.split('||')[0] ?? '').trim()
 		}
 		line = line
+			.replace(/\s*\|\|\s*.*$/g, '')
 			.replace(/https?:\/\/\S+/gi, '')
+		line = stripFactSourceNoise(line)
+		line = line
 			.replace(/\s+/g, ' ')
 			.trim()
 		if (!line) continue
@@ -660,15 +706,19 @@ async function refreshStoryDate(e, sourceUrl) {
 }
 
 function processingNeeds(e) {
+	let hasReadyTitle = hasMeaningfulText(e.titleEn) || hasMeaningfulText(e.titleRu)
+	let hasReadySummary = hasMeaningfulText(e.summary)
+	let needsTitleEn = !hasMeaningfulText(e.titleEn)
 	let needsSummary = !hasMeaningfulText(e.summary)
 	let needsFacts = !hasMeaningfulFacts(e.factsRu)
 	let needsTalkingPoints = !hasMeaningfulText(e.arguments)
-	let needsVideos = !hasVideoLinks(e.videoUrls)
+	let needsVideos = !hasVideoLinks(e.videoUrls) && !(hasReadyTitle && hasReadySummary)
 	let needsDate = !hasMeaningfulText(e.date)
 	let needsUsedUrl = !hasMeaningfulText(e.usedUrl)
 	let needsAgency = !hasMeaningfulText(e.agency) && hasResolvableAgencyInput(e)
 
 	let missing = []
+	if (needsTitleEn) missing.push('titleEn')
 	if (needsSummary) missing.push('summary')
 	if (needsAgency) missing.push('agency')
 	if (needsFacts) missing.push('factsRu')
@@ -678,6 +728,7 @@ function processingNeeds(e) {
 	if (needsUsedUrl) missing.push('usedUrl')
 
 	return {
+		needsTitleEn,
 		needsSummary,
 		needsFacts,
 		needsTalkingPoints,
@@ -738,9 +789,29 @@ function markDuplicateUrls(rows) {
 	return groups
 }
 
-async function extractVerified(url) {
+async function extractWithBrightData(url) {
+	let info = await extractArticleWithBrightData(url, { logger: log })
+	let text = normalizeText(info?.body)
+	let publishedAt = normalizeDateIso(info?.publishedAt || info?.dateTime || info?.date)
+	if (text.length > MIN_TEXT_LENGTH) {
+		return {
+			url,
+			title: info?.title,
+			text: text.slice(0, MAX_TEXT_LENGTH),
+			html: info?.bodyHtml,
+			publishedAt,
+			source: cleanAgencyName(info?.source || fallbackAgencyFromUrl(url)),
+			eventUri: '',
+		}
+	}
+	if (text.length) {
+		log('Bright Data extract too short', `${text.length} chars`, `url=${url}`)
+	}
+}
+
+async function extractWithCurrentFlow(url) {
 	for (let attempt = 0; attempt < 2; attempt++) {
-		log(`Extract attempt ${attempt + 1}/2...`)
+		log(`Current extract attempt ${attempt + 1}/2...`)
 		let info = await extractArticleInfo(url)
 		let text = normalizeText(info?.body)
 		let publishedAt = normalizeDateIso(info?.publishedAt || info?.dateTime || info?.date)
@@ -755,17 +826,122 @@ async function extractVerified(url) {
 				eventUri: String(info?.eventUri || '').trim(),
 			}
 		}
-		if (attempt === 0) log('No text extracted, retrying...')
+		if (attempt === 0) log('No current-flow text extracted, retrying...')
+	}
+}
+
+async function extractVerified(url, { allowBrightData = true, allowCurrentFlow = true } = {}) {
+	if (allowBrightData) {
+		let extracted = await extractWithBrightData(url)
+		if (extracted) return extracted
+	}
+	if (allowCurrentFlow) {
+		return await extractWithCurrentFlow(url)
 	}
 }
 
 async function decodeWithThrottle(last, gnUrl, label = 'Decoding URL...') {
-	await sleep(last.urlDecode.time + last.urlDecode.delay - Date.now())
+	await sleep(last.urlDecode.time + last.urlDecode.delay - Date.now(), 'google_news_decode_throttle')
 	last.urlDecode.delay += last.urlDecode.increment
 	last.urlDecode.time = Date.now()
 	log(label)
 	// Deprecated: gnUrl decode is kept only for legacy rows that still store Google News redirect URLs.
 	return await decodeGoogleNewsUrl(gnUrl)
+}
+
+function saveAlternativeUrls(e, sourceUrl, candidates, stageLabel) {
+	let currentUrl = normalizeHttpUrl(sourceUrl)
+	let alternativeUrls = uniq(
+		(candidates || [])
+			.map(a => normalizeHttpUrl(a?.url))
+			.filter(Boolean)
+			.filter(url => !currentUrl || url !== currentUrl)
+	)
+	if (!alternativeUrls.length) return
+	e.alternativeUrls = mergeUrlLines(e.alternativeUrls, alternativeUrls)
+	log(`${stageLabel} saved alternative URLs`, alternativeUrls.length)
+}
+
+async function selectFallbackCandidate({
+	e,
+	sourceUrl,
+	candidates,
+	searchKeywords,
+	keywordsForMatch,
+	strictKeywords,
+	stageLabel,
+}) {
+	if (!Array.isArray(candidates) || !candidates.length) return
+
+	log(`${stageLabel} candidates`, candidates.length)
+	saveAlternativeUrls(e, sourceUrl, candidates, stageLabel)
+
+	let baseSource = (e.source || '').trim().toLowerCase()
+	let baseHost = ''
+	try { baseHost = new URL(sourceUrl).hostname } catch {}
+
+	let minMatchHits = Math.min(2, keywordsForMatch.length)
+	let maxTries = 7
+	let tries = 0
+	let best = null
+
+	for (let a of candidates) {
+		if (tries >= maxTries) break
+		let url = normalizeHttpUrl(a?.url)
+		if (!url || url === sourceUrl) continue
+		if (baseSource && a.source && a.source.trim().toLowerCase() === baseSource) continue
+		if (baseHost) {
+			try {
+				if (new URL(url).hostname === baseHost) continue
+			} catch {}
+		}
+
+		let meta = `${a?.title || ''}\n${url}`
+		let metaHits = countKeywordHits(meta, searchKeywords)
+		let strictMetaHits = countKeywordHits(meta, strictKeywords)
+		let eventUri = a?.eventUri
+
+		log(
+			`Trying ${stageLabel} candidate`,
+			a.source || '',
+			eventUri ? `eventUri=${eventUri}` : '',
+			a.reason ? `reason=${a.reason}` : '',
+			`metaHits=${metaHits}/${searchKeywords.length}`,
+			`url=${url}`,
+		)
+		tries++
+
+		log(`Extracting ${stageLabel} article...`, a.source || '', `url=${url}`)
+		let extracted = await extractVerified(url)
+		if (!extracted) continue
+
+		let title = extracted.title || ''
+		let haystack = `${title}\n${extracted.text || ''}`
+		let totalHits = countKeywordHits(haystack, keywordsForMatch)
+		if (keywordsForMatch.length && totalHits < minMatchHits) {
+			log(`Skipping ${stageLabel} (low relevance)`, a.source || '', `hits=${totalHits}/${keywordsForMatch.length}`, `url=${url}`)
+			continue
+		}
+
+		let strictHits = countKeywordHits(haystack, strictKeywords)
+		if (strictKeywords.length && strictHits < 1 && strictMetaHits < 1) {
+			log(`Skipping ${stageLabel} (strict mismatch)`, a.source || '', `strict_hits=${strictHits}/${strictKeywords.length}`, `url=${url}`)
+			continue
+		}
+
+		let score = totalHits * 10 + strictHits * 25 + metaHits * 5 + strictMetaHits * 10
+		if (!best || score > best.score) {
+			best = { score, extracted, source: a.source || '', url }
+		}
+	}
+
+	if (!best?.extracted) return
+
+	log(`${stageLabel} selected`, best.source || '', `score=${best.score}`, `url=${best.url}`)
+	return {
+		...best.extracted,
+		source: cleanAgencyName(best.extracted?.source || best.source),
+	}
 }
 
 async function tryOtherAgencies(e, primaryUrl) {
@@ -786,90 +962,54 @@ async function tryOtherAgencies(e, primaryUrl) {
 	if (aiKeywords.length) log(`Fallback AI keywords (${aiKeywords.length}):`, aiKeywords.join(' '))
 	let searchKeywords = aiKeywords.length ? aiKeywords : keywords
 	log(`Fallback search keywords (${searchKeywords.length}):`, searchKeywords.join(' '))
-
-	let candidates = await findAlternativeArticles(sourceUrl, { keywords: searchKeywords })
-	if (!candidates.length) {
-		log('No alternative articles found')
-		return
-	}
-	const currentUrl = sourceUrl
-	const alternativeUrls = uniq(
-		candidates
-			.map(a => normalizeHttpUrl(a?.url))
-			.filter(Boolean)
-			.filter(url => !currentUrl || url !== currentUrl)
-	)
-	if (alternativeUrls.length) {
-		e.alternativeUrls = mergeUrlLines(e.alternativeUrls, alternativeUrls)
-		log('Saved alternative URLs:', alternativeUrls.length)
-	}
-
-	log('Found', candidates.length, 'alternative candidates')
-	let baseSource = (e.source || '').trim().toLowerCase()
-	let baseHost = ''
-	try { baseHost = new URL(sourceUrl).hostname } catch {}
 	let keywordsForMatch = keywords
 	if (keywordsForMatch.length) log('Fallback relevance keywords:', keywordsForMatch.join(' '))
 	let strictKeywords = storyStrictKeywords(e, sourceUrl)
 	if (strictKeywords.length) log('Fallback strict keywords:', strictKeywords.join(' '))
 
-	let minMatchHits = Math.min(2, keywordsForMatch.length)
-	let maxTries = 7
-	let tries = 0
-	let best = null
+	log('Looking up GPT alternative URLs...', describeAlternativeUrlLookupSettings())
+	let gptCandidates = await collectAlternativeUrlsByStory({
+		url: sourceUrl,
+		titleEn: e.titleEn,
+		titleRu: e.titleRu,
+		source: e.source,
+		keywords: searchKeywords,
+		strictKeywords,
+		date: e.date,
+	}, { logger: log })
+	let gptSelected = await selectFallbackCandidate({
+		e,
+		sourceUrl,
+		candidates: gptCandidates,
+		searchKeywords,
+		keywordsForMatch,
+		strictKeywords,
+		stageLabel: 'gpt_fallback',
+	})
+	if (gptSelected) return gptSelected
 
-	for (let a of candidates) {
-		if (tries >= maxTries) break
-		let url = a?.url
-		if (!url || url === sourceUrl) continue
-		if (baseSource && a.source && a.source.trim().toLowerCase() === baseSource) continue
-		if (baseHost) {
-			try {
-				if (new URL(url).hostname === baseHost) continue
-			} catch {}
-		}
-		let meta = `${a?.title || ''}\n${url}`
-		let metaHits = countKeywordHits(meta, searchKeywords)
-		let strictMetaHits = countKeywordHits(meta, strictKeywords)
-		let eventUri = a?.eventUri
-
-		log(
-			'Trying fallback candidate',
-			a.source || '',
-			eventUri ? `eventUri=${eventUri}` : '',
-			`metaHits=${metaHits}/${searchKeywords.length}`,
-			`url=${url}`,
-		)
-		tries++
-
-		log('Extracting fallback', a.source || '', 'article...')
-		let extracted = await extractVerified(url)
-		if (extracted) {
-			let title = extracted.title || ''
-			let haystack = `${title}\n${extracted.text || ''}`
-			let totalHits = countKeywordHits(haystack, keywordsForMatch)
-			if (keywordsForMatch.length && totalHits < minMatchHits) {
-				log('Skipping fallback (low relevance)', a.source || '', `hits=${totalHits}/${keywordsForMatch.length} total`, `url=${url}`)
-				continue
-			}
-			let strictHits = countKeywordHits(haystack, strictKeywords)
-			if (strictKeywords.length && strictHits < 1 && strictMetaHits < 1) {
-				log('Skipping fallback (strict mismatch)', a.source || '', `strict_hits=${strictHits}/${strictKeywords.length}`, `url=${url}`)
-				continue
-			}
-			let score = totalHits * 10 + strictHits * 25 + metaHits * 5 + strictMetaHits * 10
-			if (!best || score > best.score) {
-				best = { score, extracted, source: a.source || '', url }
-			}
-		}
+	log('GPT fallback did not resolve article, trying current direct flow...')
+	let directCurrent = await extractVerified(sourceUrl, { allowBrightData: false, allowCurrentFlow: true })
+	if (directCurrent) {
+		log('Current direct flow recovered original URL', `url=${sourceUrl}`)
+		return directCurrent
 	}
-	if (best?.extracted) {
-		log('Fallback selected', best.source || '', `score=${best.score}`, `url=${best.url}`)
-		return {
-			...best.extracted,
-			source: cleanAgencyName(best.extracted?.source || best.source),
-		}
+
+	let candidates = await findAlternativeArticles(sourceUrl, { keywords: searchKeywords })
+	if (!candidates.length) {
+		log('No current-flow alternative articles found')
+		return
 	}
+
+	return await selectFallbackCandidate({
+		e,
+		sourceUrl,
+		candidates,
+		searchKeywords,
+		keywordsForMatch,
+		strictKeywords,
+		stageLabel: 'current_fallback',
+	})
 }
 
 export async function summarize() {
@@ -947,6 +1087,8 @@ export async function summarize() {
 			e.titleEn || e.titleRu || '',
 		)
 		let articleText = ''
+		let articleHtml = ''
+		let articleTitle = ''
 		let sourceUrl = normalizeHttpUrl(e.url)
 		let previousUsedUrl = normalizeHttpUrl(e.usedUrl)
 		let needsAtStart = processingNeeds(e)
@@ -969,25 +1111,28 @@ export async function summarize() {
 				// Deprecated: gnUrl decode path exists only for legacy rows without a direct article URL.
 				sourceUrl = await decodeWithThrottle(last, e.gnUrl)
 				if (!sourceUrl) {
-					await sleep(5*60e3)
+					await sleep(5*60e3, 'summarize_missing_decoded_url_retry')
 					i--
 					continue
 				}
 				log('got', sourceUrl)
 			}
 		}
-		if (sourceUrl) {
-			// Always keep the actually used source URL:
-			// start with original URL, then overwrite with fallback URL if selected later.
-			e.usedUrl = sourceUrl
-			let cachedArticle = readCachedArticle(e.id, sourceUrl)
-			if (cachedArticle?.agency) e.agency = cachedArticle.agency
-			if (cachedArticle?.publishedAt) e.date = normalizeRecentStoryDate(cachedArticle.publishedAt)
-			articleText = cachedArticle?.text || ''
-			if (articleText.length > MIN_TEXT_LENGTH) {
-				log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
+			if (sourceUrl) {
+				// Always keep the actually used source URL:
+				// start with original URL, then overwrite with fallback URL if selected later.
+				e.usedUrl = sourceUrl
+				let cachedArticle = readCachedArticle(e.id, sourceUrl)
+					if (cachedArticle?.agency) e.agency = cachedArticle.agency
+					if (cachedArticle?.publishedAt) e.date = normalizeRecentStoryDate(cachedArticle.publishedAt)
+					articleTitle = String(cachedArticle?.title || '').trim()
+					if (cachedArticle?.title) e.titleEn ||= cachedArticle.title
+					articleText = cachedArticle?.text || ''
+					articleHtml = String(cachedArticle?.html || '').trim()
+					if (articleText.length > MIN_TEXT_LENGTH) {
+					log('Using cached article text', `id=${e.id}`, `${articleText.length} chars`)
+				}
 			}
-		}
 
 		let sourceChanged = !!(sourceUrl && previousUsedUrl && previousUsedUrl !== sourceUrl)
 		if (sourceChanged) {
@@ -1016,10 +1161,10 @@ export async function summarize() {
 			await refreshStoryDate(e, e.usedUrl || sourceUrl)
 		}
 		if (sourceUrl && needsTextWork && articleText.length <= MIN_TEXT_LENGTH) {
-			log('Extracting', e.source || '', 'article...', `url=${sourceUrl}`)
-			let extracted = await extractVerified(sourceUrl)
+			log('Extracting article via Bright Data exact URL...', describeBrightDataArticleExtractionSettings(), `url=${sourceUrl}`)
+			let extracted = await extractVerified(sourceUrl, { allowBrightData: true, allowCurrentFlow: false })
 			if (!extracted) {
-				log('Failed to extract article text, trying another agency...')
+				log('Bright Data exact URL failed, trying GPT/current fallbacks...')
 				extracted = await tryOtherAgencies(e, sourceUrl)
 			}
 			if (extracted) {
@@ -1032,35 +1177,42 @@ export async function summarize() {
 				}
 				let fallbackUsed = normalizeHttpUrl(e.usedUrl) && normalizeHttpUrl(sourceUrl) && normalizeHttpUrl(e.usedUrl) !== normalizeHttpUrl(sourceUrl)
 				if (fallbackUsed && extracted.title) {
+					articleTitle = extracted.title
 					e.titleEn = extracted.title
 					e.titleRu = ''
+				} else if (extracted.title) {
+					articleTitle = extracted.title
+					e.titleEn ||= extracted.title
 				}
 				let resolvedDate = resolveStoryDate({
 					sourceUrl: e.usedUrl || sourceUrl,
 					extractedPublishedAt: extracted.publishedAt,
 				})
-				if (resolvedDate) e.date = resolvedDate
-				log('got', extracted.text.length, 'chars')
-				articleText = extracted.text
-				writeArticleCache(e.id, extracted, e.titleEn || e.titleRu || '')
-			} else {
-				await refreshAgency(e, e.usedUrl || sourceUrl)
-				log('Could not extract article text. Trying URL title lookup...', describeTitleLookupSettings())
-				try {
-					let lookedUp = await collectTitleByUrl({ url: e.usedUrl || sourceUrl || e.url })
-					if (lookedUp?.titleEn || lookedUp?.titleRu) {
-						e.titleEn ||= lookedUp.titleEn
-						e.titleRu ||= lookedUp.titleRu
-						log('Title lookup done', `titleEn=${lookedUp.titleEn ? 'yes' : 'no'}`, `titleRu=${lookedUp.titleRu ? 'yes' : 'no'}`)
-					} else {
-						log('Title lookup failed (empty title)')
-					}
-					if (lookedUp?.extra) {
-						log('Title lookup extra:', lookedUp.extra)
-					}
-				} catch (err) {
-					log('Title lookup failed', err?.message || err)
+					if (resolvedDate) e.date = resolvedDate
+					log('got', extracted.text.length, 'chars')
+					articleText = extracted.text
+					articleHtml = String(extracted.html || '').trim()
+					writeArticleCache(e.id, extracted, e.titleEn || e.titleRu || '')
+				} else {
+					await refreshAgency(e, e.usedUrl || sourceUrl)
 				}
+			}
+		if (sourceUrl && initialNeeds.needsTitleEn && !hasMeaningfulText(e.titleEn)) {
+			log('TitleEn is missing. Trying URL title lookup...', describeTitleLookupSettings())
+			try {
+				let lookedUp = await collectTitleByUrl({ url: e.usedUrl || sourceUrl || e.url })
+				if (lookedUp?.titleEn || lookedUp?.titleRu) {
+					e.titleEn ||= lookedUp.titleEn
+					e.titleRu ||= lookedUp.titleRu
+					log('Title lookup done', `titleEn=${lookedUp.titleEn ? 'yes' : 'no'}`, `titleRu=${lookedUp.titleRu ? 'yes' : 'no'}`)
+				} else {
+					log('Title lookup failed (empty title)')
+				}
+				if (lookedUp?.extra) {
+					log('Title lookup extra:', lookedUp.extra)
+				}
+			} catch (err) {
+				log('Title lookup failed', err?.message || err)
 			}
 		}
 		if (!hasMeaningfulText(e.date) && sourceUrl && !triedDateRefresh) {
@@ -1068,49 +1220,50 @@ export async function summarize() {
 			await refreshStoryDate(e, e.usedUrl || sourceUrl)
 		}
 
-		const currentNeeds = processingNeeds(e)
-		const forceSupportRefreshForNewSummary = articleText.length > MIN_TEXT_LENGTH
-			&& currentNeeds.needsSummary
-			&& (hasMeaningfulFacts(e.factsRu) || hasMeaningfulText(e.arguments))
-		if (forceSupportRefreshForNewSummary) {
-			log('Summary is missing while facts/talking points exist -> regenerating support blocks')
-		}
-		const talkingPointsInput = buildTalkingPointsInput({
-			articleText,
-			titleEn: e.titleEn,
-			titleRu: e.titleRu,
-			summary: e.summary,
-			factsRu: forceSupportRefreshForNewSummary ? '' : e.factsRu,
-			agency: resolveSummaryAttributionSource(e),
-			url: e.usedUrl || sourceUrl || e.url,
-		})
-		const shouldSummarize = articleText.length > 400 && currentNeeds.needsSummary
-		const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH
-			&& (currentNeeds.needsFacts || forceSupportRefreshForNewSummary)
-		const shouldCollectTalkingPoints = hasMeaningfulText(talkingPointsInput)
-			&& (currentNeeds.needsTalkingPoints || forceSupportRefreshForNewSummary)
-		const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsVideos
+			const currentNeeds = processingNeeds(e)
+			const talkingPointsInput = buildTalkingPointsInput({
+				articleText,
+				titleEn: e.titleEn,
+				titleRu: e.titleRu,
+				summary: e.summary,
+				factsRu: e.factsRu,
+				agency: resolveSummaryAttributionSource(e),
+				url: e.usedUrl || sourceUrl || e.url,
+			})
+			const shouldSummarize = articleText.length > 400 && currentNeeds.needsSummary
+			const shouldCollectFacts = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsFacts
+			const shouldCollectTalkingPoints = hasMeaningfulText(talkingPointsInput)
+				&& currentNeeds.needsTalkingPoints
+			const shouldCollectVideos = articleText.length > MIN_TEXT_LENGTH && currentNeeds.needsVideos
 
-		if (shouldSummarize || shouldCollectFacts || shouldCollectTalkingPoints || shouldCollectVideos) {
-			let enrichInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText }
-			let tasks = []
-			const makeLogger = (task) => (...params) => task.logs.push(params)
+			if (shouldSummarize || shouldCollectFacts || shouldCollectTalkingPoints || shouldCollectVideos) {
+				let enrichInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText, html: articleHtml, articleTitle }
+				let tasks = []
+				const makeLogger = (taskName) => (...params) => log(`[${taskName}]`, ...params)
+				const traceTask = (name, runner) => async () => {
+					let startedAt = Date.now()
+					log(`Task ${name} started`)
+					try {
+						return await runner()
+					} finally {
+						log(`Task ${name} finished`, `ms=${Date.now() - startedAt}`)
+					}
+				}
 
 			if (shouldSummarize) {
 				log('Summarizing', articleText.length, 'chars...')
 				let task = {
 					name: 'summary',
-					logs: [],
-					run: async () => {
-						await sleep(last.ai.time + last.ai.delay - Date.now())
+					run: traceTask('summary', async () => {
+						await sleep(last.ai.time + last.ai.delay - Date.now(), 'summary_throttle')
 						last.ai.time = Date.now()
 						return await ai({
 							url: e.usedUrl || sourceUrl || e.url,
 							agency: resolveSummaryAttributionSource(e),
 							text: articleText,
-							logger: makeLogger(task),
+							logger: makeLogger('summary'),
 						})
-					}
+					})
 				}
 				tasks.push(task)
 			}
@@ -1119,12 +1272,11 @@ export async function summarize() {
 				log('Collecting facts...', describeFactsSettings())
 				let task = {
 					name: 'facts',
-					logs: [],
-					run: async () => {
-						await sleep(last.facts.time + last.facts.delay - Date.now())
+					run: traceTask('facts', async () => {
+						await sleep(last.facts.time + last.facts.delay - Date.now(), 'facts_throttle')
 						last.facts.time = Date.now()
-						return await collectFacts(enrichInput, { logger: makeLogger(task) })
-					}
+						return await collectFacts(enrichInput, { logger: makeLogger('facts') })
+					})
 				}
 				tasks.push(task)
 			}
@@ -1133,15 +1285,14 @@ export async function summarize() {
 				log('Collecting talking points...', describeTalkingPointsSettings())
 				let task = {
 					name: 'talking_points',
-					logs: [],
-					run: async () => {
-						await sleep(last.talkingPoints.time + last.talkingPoints.delay - Date.now())
+					run: traceTask('talking_points', async () => {
+						await sleep(last.talkingPoints.time + last.talkingPoints.delay - Date.now(), 'talking_points_throttle')
 						last.talkingPoints.time = Date.now()
 						return await collectTalkingPoints(
 							{ ...enrichInput, text: talkingPointsInput },
-							{ logger: makeLogger(task) }
+							{ logger: makeLogger('talking_points') }
 						)
-					}
+					})
 				}
 				tasks.push(task)
 			}
@@ -1150,12 +1301,11 @@ export async function summarize() {
 				log('Collecting videos...', describeVideosSettings())
 				let task = {
 					name: 'videos',
-					logs: [],
-					run: async () => {
-						await sleep(last.videos.time + last.videos.delay - Date.now())
+					run: traceTask('videos', async () => {
+						await sleep(last.videos.time + last.videos.delay - Date.now(), 'videos_throttle')
 						last.videos.time = Date.now()
-						return await collectVideos(enrichInput, { logger: makeLogger(task) })
-					}
+						return await collectVideos(enrichInput, { logger: makeLogger('videos') })
+					})
 				}
 				tasks.push(task)
 			}
@@ -1168,10 +1318,6 @@ export async function summarize() {
 			for (let i = 0; i < tasks.length; i++) {
 				let task = tasks[i]
 				let result = results[i]
-
-				for (let params of task.logs || []) {
-					log(...params)
-				}
 
 				if (result.status === 'rejected') {
 					log(`${task.name} failed`, result.reason?.message || result.reason || '')
@@ -1207,7 +1353,7 @@ export async function summarize() {
 							articleText = refreshedText
 							let retryInput = { ...e, url: e.usedUrl || sourceUrl || e.url, text: articleText }
 							log('Collecting facts retry after forced text refresh...', describeFactsSettings())
-							await sleep(last.facts.time + last.facts.delay - Date.now())
+							await sleep(last.facts.time + last.facts.delay - Date.now(), 'facts_retry_throttle')
 							last.facts.time = Date.now()
 							let retryRaw = await collectFacts(retryInput, { logger: log })
 							if (hasFactsRefusalMarker(retryRaw)) {

@@ -65,6 +65,13 @@ mock.module(mod('browse-article.js'), {
 	}
 })
 
+mock.module(mod('brightdata-article.js'), {
+	namedExports: {
+		extractArticleWithBrightData: async () => null,
+		describeBrightDataArticleExtractionSettings: () => 'brightdata=mock',
+	}
+})
+
 const extractCalls = new Map()
 const altCalls = new Map()
 mock.module(mod('newsapi.js'), {
@@ -122,6 +129,7 @@ mock.module(mod('sleep.js'), {
 
 	mock.module(mod('enrich.js'), {
 		namedExports: {
+			collectAlternativeUrlsByStory: async () => [],
 			collectFacts: async ({ url }) => `- Факт для ${url}\n- Еще один факт`,
 			collectTalkingPoints: async ({ url }) => [
 				`“Кто платит, тот задаёт рамку решения” В истории по ${url} источники ресурсов определяют границы допустимых действий и переговорную позицию участников. Если финансовые потоки управляются извне, автономия решений становится условной. Где заканчивается поддержка и начинается внешнее управление?`,
@@ -136,6 +144,7 @@ mock.module(mod('sleep.js'), {
 			describeTalkingPointsSettings: () => 'model=mock',
 			describeVideosSettings: () => 'model=mock',
 			describeTitleLookupSettings: () => 'model=mock',
+			describeAlternativeUrlLookupSettings: () => 'model=mock',
 		}
 	})
 
@@ -155,13 +164,16 @@ mock.module(mod('log.js'), {
 const { summarize } = await import(mod('2.summarize.js'))
 
 test('summarize pipeline (mocked)', async () => {
+	const realDateNow = Date.now
+	Date.now = () => new Date('2026-03-09T00:00:00.000Z').getTime()
 	fs.mkdirSync(articlesDir, { recursive: true })
-	for (const row of newsRows) {
-		const htmlPath = path.join(articlesDir, `${row.id}.html`)
-		const txtPath = path.join(articlesDir, `${row.id}.txt`)
-		if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath)
-		if (fs.existsSync(txtPath)) fs.unlinkSync(txtPath)
-	}
+	try {
+		for (const row of newsRows) {
+			const htmlPath = path.join(articlesDir, `${row.id}.html`)
+			const txtPath = path.join(articlesDir, `${row.id}.txt`)
+			if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath)
+			if (fs.existsSync(txtPath)) fs.unlinkSync(txtPath)
+		}
 
 		await summarize()
 
@@ -217,9 +229,12 @@ test('summarize pipeline (mocked)', async () => {
 		const txtPath = path.join(articlesDir, `${row.id}.txt`)
 		assert.ok(fs.existsSync(htmlPath), `Missing html output for id=${row.id}`)
 		assert.ok(fs.existsSync(txtPath), `Missing txt output for id=${row.id}`)
-		const txtContent = fs.readFileSync(txtPath, 'utf8')
-		assert.match(txtContent, /^Agency:\s+/m, `Missing cache agency metadata for id=${row.id}`)
-		assert.match(txtContent, /^PublishedAt:\s+/m, `Missing cache publishedAt metadata for id=${row.id}`)
-		assert.match(txtContent, /^EventUri:\s+/m, `Missing cache eventUri metadata for id=${row.id}`)
+			const txtContent = fs.readFileSync(txtPath, 'utf8')
+			assert.match(txtContent, /^Agency:\s+/m, `Missing cache agency metadata for id=${row.id}`)
+			assert.match(txtContent, /^PublishedAt:\s+/m, `Missing cache publishedAt metadata for id=${row.id}`)
+			assert.match(txtContent, /^EventUri:\s+/m, `Missing cache eventUri metadata for id=${row.id}`)
+		}
+	} finally {
+		Date.now = realDateNow
 	}
 })

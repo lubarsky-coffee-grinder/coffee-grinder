@@ -86,19 +86,34 @@ Strict rules:
 – avoid generalities and vague background
 – do NOT include any links or URLs
 – do NOT include domains, channel handles, or nicknames (example.com, t.me/name, @name)
-– output facts as text only
+– do NOT include markdown links, citation brackets, or source tails like ([source](...)), (example.com), [example.com]
+- do NOT append source names in parentheses or at the end of a fact
+– the fact text field must contain plain text only, with no source tail
 
 Critical constraint:
 Only include external facts that are highly reliable, widely documented, and directly relevant to understanding this specific story.
 
 Formatting:
-– output only a bullet list
-– 8 to 12 bullet points
-– one fact per bullet
+– return ONLY valid JSON
+– no markdown, no prose, no bullet list
+– 8 to 12 facts when possible
+– one fact per item
+– each item must have:
+  - "fact": the Russian fact text only
+  - "sourceUrl": the supporting source URL, or empty string
 
 If you cannot find at least 8 reliable complementary facts,
-output fewer bullets and clearly mark the list as:
-«Недостаточно надёжных дополняющих фактов».`,
+return fewer items.
+
+Output JSON:
+{
+  "facts": [
+    {
+      "fact": "string",
+      "sourceUrl": "string"
+    }
+  ]
+}`,
 	},
 	{
 		name: 'summarize:arguments',
@@ -220,6 +235,51 @@ Output JSON:
   "titleRu": "string",   // optional Russian translation of the headline
   "extra": "string"      // optional one short context sentence in Russian
 }`,
+	},
+	{
+		name: 'summarize:alternative-url-search',
+		prompt: `You are a newsroom link-research assistant.
+
+Task:
+Find direct article URLs from other news agencies covering the same specific news event/story as the original article.
+
+Input:
+- Strategy hint
+- Original URL
+- Original host
+- Original source name
+- Known title
+- Search keywords
+- Strict keywords
+- Optional story date
+
+Rules:
+- Use web search.
+- Return only direct article URLs, not homepages, category pages, tag pages, search pages, video pages, social posts, or aggregators.
+- Prefer established news outlets and agencies.
+- Exclude the original host and the original source.
+- Prefer pages that appear to describe the same concrete event, not broad background coverage.
+- If confidence is low, return fewer candidates or an empty list.
+- Do not invent URLs.
+- No markdown, no prose outside JSON.
+
+Output JSON:
+{
+  "candidates": [
+    {
+      "url": "https://example.com/article",
+      "source": "Outlet name",
+      "title": "Article title",
+      "publishedAt": "ISO-8601 or empty string",
+      "reason": "very short reason"
+    }
+  ]
+}
+
+Constraints:
+- Maximum 6 candidates.
+- Keep reason short and factual.
+- Return JSON only.`,
 	},
 	{
 		name: 'audio:audio-transcription',

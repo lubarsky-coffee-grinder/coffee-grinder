@@ -48,7 +48,7 @@ const VERIFY_MIN_CONFIDENCE = 0.7
 const VERIFY_TEMPERATURE = 0
 const VERIFY_REASONING_EFFORT = 'medium'
 const VIDEO_WEBSEARCH_REASONING_EFFORT = 'low'
-const VIDEO_WEBSEARCH_TEMPERATURE = 0
+const VIDEO_WEBSEARCH_TEMPERATURE = undefined
 const VERIFY_VIDEO_DESCRIPTION_MAX_CHARS = 700
 const MAX_VERIFY_VIDEOS_PER_PAGE = 6
 const HOST_COOLDOWN_FAILURE_LIMIT = 2
@@ -57,10 +57,11 @@ const HOST_COOLDOWN_STATUS_CODES = new Set([401, 403, 429])
 const VIDEO_VERIFY_DEFAULT_MODEL = 'gpt-4o-mini'
 const explicitVideoVerifyModel = readEnv('OPENAI_VIDEO_VERIFY_MODEL')
 const videoVerifyModel = explicitVideoVerifyModel || VIDEO_VERIFY_DEFAULT_MODEL
-const VIDEO_WEBSEARCH_DEFAULT_MODEL = 'gpt-4o'
+const VIDEO_WEBSEARCH_DEFAULT_MODEL = 'gpt-5.4'
 const VIDEO_WEBSEARCH_PROMPT_NAME = 'summarize:videos'
 const explicitVideoWebSearchModel = readEnv('OPENAI_VIDEO_WEBSEARCH_MODEL')
-const videoWebSearchModel = explicitVideoWebSearchModel || videoVerifyModel || VIDEO_WEBSEARCH_DEFAULT_MODEL
+const videoWebSearchModel = explicitVideoWebSearchModel || VIDEO_WEBSEARCH_DEFAULT_MODEL
+const VIDEO_WEBSEARCH_PARALLEL_REQUESTS = 3
 const videoVerifyEnabled = process.env.VIDEO_GPT_VERIFY !== '0' && !!process.env.OPENAI_API_KEY
 const videoWebSearchEnabled = process.env.VIDEO_GPT_WEBSEARCH !== '0' && !!process.env.OPENAI_API_KEY
 const openai = (videoVerifyEnabled || videoWebSearchEnabled) ? new OpenAI() : null
@@ -71,6 +72,7 @@ let serpapiDisabledLogged = false
 const youtubeSourceCache = new Map()
 const youtubeRssSourceCache = new Map()
 const youtubeRssFeedCache = new Map()
+const youtubeMetadataCache = new Map()
 const youtubeApiEnabledByConfig = readEnv('YOUTUBE_API_ENABLED') === '1'
 const youtubeClientId = readEnv('GOOGLE_CLIENT_ID')
 const youtubeClientSecret = readEnv('GOOGLE_CLIENT_SECRET')
@@ -718,10 +720,13 @@ function hostTokens(url) {
 	)
 }
 
-function buildStoryKeywords({ titleEn, titleRu, url, text }) {
+function storyOriginalTitle(story) {
+	return normalizeQueryText(story?.articleTitle || story?.titleEn || '')
+}
+
+function buildStoryKeywords({ articleTitle, titleEn, titleRu, url, text }) {
 	let titleTokens = [
-		...tokenList(titleEn),
-		...tokenList(titleRu),
+		...tokenList(storyOriginalTitle({ articleTitle, titleEn })),
 	]
 	let pathTokens = []
 	try {
@@ -739,11 +744,32 @@ function buildStoryKeywords({ titleEn, titleRu, url, text }) {
 	let base = uniq([...titleTokens, ...pathTokens])
 	let leadCap = base.length >= 4 ? 6 : 12
 	let list = uniq([...base, ...leadTokens.slice(0, leadCap)])
+	if (!list.length) list = tokenList(titleRu)
 
 	let banned = hostTokens(url)
 	if (banned.size) list = list.filter(v => !banned.has(v))
 
 	return uniq(list).slice(0, 24)
+}
+
+function storyUrlSearchTokens(story) {
+	try {
+		let path = new URL(String(story?.usedUrl || story?.url || '')).pathname
+		return uniq(tokenList(path)).slice(0, 12)
+	} catch {
+		return []
+	}
+}
+
+function storyPrimarySearchSignals(story) {
+	let title = storyOriginalTitle(story)
+	let titleTokens = uniq(tokenList(title)).slice(0, 12)
+	let urlTokens = storyUrlSearchTokens(story)
+	return {
+		title,
+		titleTokens,
+		urlTokens,
+	}
 }
 
 function storyYearTokens(story) {
@@ -764,15 +790,24 @@ function normalizeQueryText(value) {
 }
 
 function buildYoutubeSearchQueries(story, storyKeywords, { openFallback = false } = {}) {
-	let title = normalizeQueryText(story?.titleEn || story?.titleRu || '')
+	let primary = storyPrimarySearchSignals(story)
+	let title = primary.title
 	if (title.length > 140) title = title.slice(0, 140).trim()
+	let urlSeed = normalizeQueryText(primary.urlTokens.slice(0, 4).join(' '))
 
 	let must = (storyKeywords || []).slice(0, 4)
 	let context = (storyKeywords || []).slice(4, 12)
 	let years = storyYearTokens(story).slice(0, 1)
 
 	let queries = []
-	if (title) queries.push(title)
+	if (title) {
+		queries.push(title)
+		if (urlSeed) queries.push(normalizeQueryText([title, ...primary.urlTokens.slice(0, 2), ...years].join(' ')))
+	} else if (urlSeed) {
+		queries.push(normalizeQueryText([...primary.urlTokens.slice(0, 4), ...years].join(' ')))
+	} else if (must.length) {
+		queries.push(normalizeQueryText([...must.slice(0, 4), ...years].join(' ')))
+	}
 	if (must.length >= 2) queries.push(normalizeQueryText([...must.slice(0, 3), ...years].join(' ')))
 	if (must.length) queries.push(normalizeQueryText([...must.slice(0, 2), ...context.slice(0, 2), ...years].join(' ')))
 	if (openFallback && context.length) {
@@ -842,20 +877,68 @@ function countKeywordHits(haystack, keywords) {
 	return hits
 }
 
+function buildStoryMatchSignals(haystack, story, storyKeywords) {
+	let primary = storyPrimarySearchSignals(story)
+	let normalizedHaystack = String(haystack || '').toLowerCase()
+	let titlePhrase = String(primary.title || '').toLowerCase()
+	let titlePhraseHit = titlePhrase && normalizedHaystack.includes(titlePhrase) ? 1 : 0
+	let titleHits = countKeywordHits(normalizedHaystack, primary.titleTokens)
+	let urlHits = countKeywordHits(normalizedHaystack, primary.urlTokens)
+	let keywordHits = countKeywordHits(normalizedHaystack, storyKeywords)
+	let primaryHits = titlePhraseHit + titleHits + urlHits
+	let matchScore = titlePhraseHit * 100 + titleHits * 20 + urlHits * 12 + keywordHits
+	return {
+		titlePhraseHit,
+		titleHits,
+		urlHits,
+		primaryHits,
+		keywordHits,
+		matchScore,
+	}
+}
+
+function compareCandidatesByStorySignals(a, b) {
+	let scoreDelta = (b.matchScore || 0) - (a.matchScore || 0)
+	if (scoreDelta) return scoreDelta
+	let primaryDelta = (b.primaryHits || 0) - (a.primaryHits || 0)
+	if (primaryDelta) return primaryDelta
+	let keywordDelta = (b.keywordHits || 0) - (a.keywordHits || 0)
+	if (keywordDelta) return keywordDelta
+	let aMs = parseDateValue(a.publishedAt)
+	let bMs = parseDateValue(b.publishedAt)
+	if (Number.isFinite(aMs) && Number.isFinite(bMs)) return bMs - aMs
+	return 0
+}
+
+function preferPrimaryStorySignals(candidates, { sourceName = '', logger = null, logPrefix = 'VIDEOS' } = {}) {
+	let list = Array.isArray(candidates) ? candidates : []
+	if (!list.length) return []
+	let primary = list.filter(v => (v.primaryHits || 0) > 0)
+	if (primary.length) {
+		return primary.sort(compareCandidatesByStorySignals)
+	}
+	let keywordFallback = list.filter(v => (v.keywordHits || 0) >= MIN_KEYWORD_HITS)
+	if (!keywordFallback.length) {
+		if (logger) logger(`${logPrefix} source skipped: no title/url hits`, `source=${sourceName || 'unknown'}`)
+		return []
+	}
+	if (logger) {
+		logger(
+			`${logPrefix} keyword fallback:`,
+			`source=${sourceName || 'unknown'}`,
+			`kept=${keywordFallback.length}/${list.length}`,
+		)
+	}
+	return keywordFallback.sort(compareCandidatesByStorySignals)
+}
+
 function limitVerifyPoolBySignal(withHits, { storyKeywords, remainingBudget, sourceName = '', logger = null } = {}) {
 	let sorted = (withHits || [])
-		.sort((a, b) => {
-			let hitsDelta = (b.keywordHits || 0) - (a.keywordHits || 0)
-			if (hitsDelta) return hitsDelta
-			let aMs = parseDateValue(a.publishedAt)
-			let bMs = parseDateValue(b.publishedAt)
-			if (Number.isFinite(aMs) && Number.isFinite(bMs)) return bMs - aMs
-			return 0
-		})
+		.sort(compareCandidatesByStorySignals)
 
 	if (!sorted.length) return []
 
-	let topHits = Number(sorted[0]?.keywordHits || 0)
+	let topHits = Number(sorted[0]?.primaryHits || sorted[0]?.keywordHits || 0)
 	let cap = YOUTUBE_VERIFY_VIDEOS_PER_SOURCE
 
 	// Low-signal matches (single generic token) are expensive and usually noisy.
@@ -993,53 +1076,203 @@ function parseYoutubeShortDescription(html) {
 	}
 }
 
+function decodeJsonStringValue(value) {
+	let raw = String(value || '')
+	if (!raw) return ''
+	try {
+		return String(JSON.parse(`"${raw}"`) || '')
+	} catch {
+		return raw
+	}
+}
+
+function parseYoutubePlayabilityStatus(html) {
+	let text = String(html || '')
+	if (!text) return { status: '', reason: '' }
+	let status = String(
+		text.match(/"playabilityStatus"\s*:\s*\{[\s\S]*?"status"\s*:\s*"([^"]+)"/i)?.[1]
+		|| ''
+	).trim()
+	let reason = decodeJsonStringValue(
+		text.match(/"playabilityStatus"\s*:\s*\{[\s\S]*?"reason"\s*:\s*"((?:\\.|[^"\\])*)"/i)?.[1]
+		|| text.match(/"playabilityStatus"\s*:\s*\{[\s\S]*?"simpleText"\s*:\s*"((?:\\.|[^"\\])*)"/i)?.[1]
+		|| ''
+	).trim()
+	return { status, reason }
+}
+
+function inferYoutubeAvailabilityFromWatchHtml(html) {
+	let text = String(html || '')
+	if (!text) return { available: null, reason: '' }
+
+	let playability = parseYoutubePlayabilityStatus(text)
+	if (playability.status) {
+		if (playability.status === 'OK') return { available: true, reason: '' }
+		return {
+			available: false,
+			reason: playability.reason || `playability_${playability.status.toLowerCase()}`,
+		}
+	}
+
+	let title = parseMetaTagContent(text, 'og:title') || parseMetaTagContent(text, 'title')
+	let unavailableHint = `${title}\n${htmlToSnippet(text, 400)}`
+	if (/\bvideo unavailable\b/i.test(unavailableHint)) {
+		return { available: false, reason: title || 'video_unavailable' }
+	}
+	if (/\bthis video is private\b/i.test(unavailableHint)) {
+		return { available: false, reason: title || 'video_private' }
+	}
+	if (/\bthis video has been removed\b/i.test(unavailableHint)) {
+		return { available: false, reason: title || 'video_removed' }
+	}
+	if (title) return { available: true, reason: '' }
+	return { available: null, reason: '' }
+}
+
+function logUnavailableYoutubeVideo({ source = '', videoUrl = '', reason = '', logger = console.log }) {
+	logger(
+		'VIDEOS unavailable:',
+		`source=${source || 'unknown'}`,
+		`reason=${reason || 'unavailable'}`,
+		`video=${videoUrl || 'n/a'}`,
+	)
+}
+
 async function fetchYoutubeMetadata(videoUrl, logger = console.log) {
 	let normalized = normalizeYoutubeUrl(videoUrl)
-	if (!normalized) return { title: '', author: '', description: '' }
-	let videoId = youtubeVideoId(normalized)
-	let meta = { title: '', author: '', description: '' }
-
-	try {
-		let endpoint = new URL('https://www.youtube.com/oembed')
-		endpoint.searchParams.set('url', normalized)
-		endpoint.searchParams.set('format', 'json')
-		let res = await fetch(endpoint, { signal: AbortSignal.timeout(YOUTUBE_OEMBED_TIMEOUT_MS) })
-		if (res.ok) {
-			let json = await res.json().catch(() => ({}))
-			meta.title = String(json?.title || '').trim()
-			meta.author = String(json?.author_name || '').trim()
-		}
-	} catch (e) {
-		logger('VIDEOS_YOUTUBE_META failed', String(e?.message || e))
+	if (!normalized) return { title: '', author: '', description: '', available: null, availabilityReason: '' }
+	if (youtubeMetadataCache.has(normalized)) {
+		return await youtubeMetadataCache.get(normalized)
 	}
 
-	if (!videoId) return meta
-
-	try {
-		let watchUrl = new URL('https://www.youtube.com/watch')
-		watchUrl.searchParams.set('v', videoId)
-		watchUrl.searchParams.set('hl', 'en')
-		let res = await fetch(watchUrl, { signal: AbortSignal.timeout(YOUTUBE_WATCH_TIMEOUT_MS) })
-		if (!res.ok) return meta
-
-		let html = await res.text().catch(() => '')
-		if (!html) return meta
-
-		if (!meta.title) meta.title = parseMetaTagContent(html, 'og:title') || parseMetaTagContent(html, 'title')
-		if (!meta.description) {
-			meta.description = parseMetaTagContent(html, 'og:description')
-				|| parseMetaTagContent(html, 'description')
-				|| parseYoutubeShortDescription(html)
+	let promise = (async () => {
+		let videoId = youtubeVideoId(normalized)
+		let meta = {
+			title: '',
+			author: '',
+			description: '',
+			available: null,
+			availabilityReason: '',
 		}
-	} catch (e) {
-		logger('VIDEOS_YOUTUBE_META watch fetch failed', String(e?.message || e))
+		let oembedOk = false
+		let oembedStatus = 0
+
+		try {
+			let endpoint = new URL('https://www.youtube.com/oembed')
+			endpoint.searchParams.set('url', normalized)
+			endpoint.searchParams.set('format', 'json')
+			let res = await fetch(endpoint, { signal: AbortSignal.timeout(YOUTUBE_OEMBED_TIMEOUT_MS) })
+			oembedStatus = Number(res?.status || 0)
+			if (res.ok) {
+				let json = await res.json().catch(() => ({}))
+				meta.title = String(json?.title || '').trim()
+				meta.author = String(json?.author_name || '').trim()
+				meta.available = true
+				oembedOk = true
+			}
+		} catch (e) {
+			logger('VIDEOS_YOUTUBE_META failed', String(e?.message || e))
+		}
+
+		if (!videoId) {
+			if (meta.available == null && oembedStatus && oembedStatus < 500 && oembedStatus !== 429) {
+				meta.available = false
+				meta.availabilityReason = `oembed_${oembedStatus}`
+			}
+			return meta
+		}
+
+		try {
+			let watchUrl = new URL('https://www.youtube.com/watch')
+			watchUrl.searchParams.set('v', videoId)
+			watchUrl.searchParams.set('hl', 'en')
+			let res = await fetch(watchUrl, { signal: AbortSignal.timeout(YOUTUBE_WATCH_TIMEOUT_MS) })
+			let watchStatus = Number(res?.status || 0)
+			if (!res.ok) {
+				if (meta.available == null && watchStatus && watchStatus < 500 && watchStatus !== 429) {
+					meta.available = false
+					meta.availabilityReason = `watch_${watchStatus}`
+				}
+				return meta
+			}
+
+			let html = await res.text().catch(() => '')
+			if (!html) return meta
+
+			let availability = inferYoutubeAvailabilityFromWatchHtml(html)
+			if (availability.available != null) meta.available = availability.available
+			if (availability.reason) meta.availabilityReason = availability.reason
+
+			if (!meta.title) meta.title = parseMetaTagContent(html, 'og:title') || parseMetaTagContent(html, 'title')
+			if (!meta.description) {
+				meta.description = parseMetaTagContent(html, 'og:description')
+					|| parseMetaTagContent(html, 'description')
+					|| parseYoutubeShortDescription(html)
+			}
+		} catch (e) {
+			logger('VIDEOS_YOUTUBE_META watch fetch failed', String(e?.message || e))
+		}
+
+		if (meta.available == null) {
+			if (oembedOk || meta.title || meta.author) {
+				meta.available = true
+			} else if (oembedStatus && oembedStatus < 500 && oembedStatus !== 429) {
+				meta.available = false
+				meta.availabilityReason = `oembed_${oembedStatus}`
+			}
+		}
+
+		meta.description = String(meta.description || '')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.slice(0, VERIFY_VIDEO_DESCRIPTION_MAX_CHARS)
+		return meta
+	})()
+
+	youtubeMetadataCache.set(normalized, promise)
+	return await promise
+}
+
+async function enrichYoutubeVideoCandidate(video, { source = '', channelTitle = '', logger = console.log } = {}) {
+	let normalizedUrl = normalizeYoutubeUrl(video?.url)
+	if (!normalizedUrl) return null
+
+	let meta = await fetchYoutubeMetadata(normalizedUrl, logger)
+	if (meta.available === false) {
+		logUnavailableYoutubeVideo({
+			source,
+			videoUrl: normalizedUrl,
+			reason: meta.availabilityReason,
+			logger,
+		})
+		return null
 	}
 
-	meta.description = String(meta.description || '')
-		.replace(/\s+/g, ' ')
-		.trim()
-		.slice(0, VERIFY_VIDEO_DESCRIPTION_MAX_CHARS)
-	return meta
+	let enriched = {
+		url: normalizedUrl,
+		source: String(video?.source || source || '').trim(),
+		title: String(meta.title || video?.title || '').trim(),
+		author: String(meta.author || video?.author || channelTitle || source || '').trim(),
+		description: String(meta.description || video?.description || '').trim(),
+		publishedAt: String(video?.publishedAt || '').trim(),
+	}
+
+	let excluded = isExcludedVideoByChannel({
+		source,
+		channelTitle,
+		author: enriched.author,
+	})
+	if (excluded) {
+		logger(
+			'VIDEOS excluded channel:',
+			`source=${source || 'unknown'}`,
+			`author=${enriched.author || 'unknown'}`,
+			`video=${normalizedUrl}`,
+		)
+		return null
+	}
+
+	return enriched
 }
 
 function htmlToSnippet(html, maxChars = VERIFY_SNIPPET_MAX_CHARS) {
@@ -1365,7 +1598,7 @@ async function searchTrustedPagesViaSerpApi(story, { originMs, storyKeywords, lo
 					if (isTransientHttpStatus(status) && !retriedTransient) {
 						retriedTransient = true
 						logger('VIDEOS_SERPAPI transient error, retrying once', `status=${status}`)
-						await sleep(SERPAPI_RETRY_DELAY_MS)
+						await sleep(SERPAPI_RETRY_DELAY_MS, 'videos_serpapi_transient_retry')
 						continue
 					}
 					break
@@ -1403,7 +1636,7 @@ async function searchTrustedPagesViaSerpApi(story, { originMs, storyKeywords, lo
 				if (isTimeoutLikeError(e) && !retriedTransient) {
 					retriedTransient = true
 					logger('VIDEOS_SERPAPI timeout, retrying once')
-					await sleep(SERPAPI_RETRY_DELAY_MS)
+					await sleep(SERPAPI_RETRY_DELAY_MS, 'videos_serpapi_timeout_retry')
 					continue
 				}
 				logger('VIDEOS_SERPAPI error\n', e)
@@ -1542,7 +1775,7 @@ async function youtubeApiGetJson(url, { logger }) {
 				if (isTransientHttpStatus(status) && !retriedTransient) {
 					retriedTransient = true
 					logger('VIDEOS_YTAPI transient error, retrying once', `status=${status}`)
-					await sleep(YOUTUBE_API_RETRY_DELAY_MS)
+					await sleep(YOUTUBE_API_RETRY_DELAY_MS, 'videos_youtube_api_http_retry')
 					continue
 				}
 
@@ -1557,7 +1790,7 @@ async function youtubeApiGetJson(url, { logger }) {
 			if (isTransientApiError(e) && !retriedTransient) {
 				retriedTransient = true
 				logger('VIDEOS_YTAPI transient error, retrying once')
-				await sleep(YOUTUBE_API_RETRY_DELAY_MS)
+				await sleep(YOUTUBE_API_RETRY_DELAY_MS, 'videos_youtube_api_transient_retry')
 				continue
 			}
 			logger('VIDEOS_YTAPI error', String(e?.message || e))
@@ -1622,19 +1855,19 @@ async function fetchYoutubeChannelPage(url, { logger }) {
 			})
 			if (!response.ok) {
 				if (attempt >= 1 || !isTransientHttpStatus(response.status)) return ''
-				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS)
+				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS, 'videos_youtube_channel_fetch_http_retry')
 				continue
 			}
 			let html = await response.text().catch(() => '')
 			if (html) return html
 			if (attempt < 1) {
-				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS)
+				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS, 'videos_youtube_channel_fetch_empty_retry')
 				continue
 			}
 			return ''
 		} catch (e) {
 			if (isTransientApiError(e) && attempt < 1) {
-				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS)
+				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS, 'videos_youtube_channel_fetch_transient_retry')
 				continue
 			}
 			logger('VIDEOS_YTRSS channel fetch failed', String(e?.message || e))
@@ -1738,7 +1971,7 @@ async function fetchYoutubeRssEntriesForSource(source, { logger }) {
 				trackApiResult('youtuberss', 'failed')
 				if (isTransientHttpStatus(response.status) && !retriedTransient) {
 					retriedTransient = true
-					await sleep(YOUTUBE_RSS_RETRY_DELAY_MS)
+					await sleep(YOUTUBE_RSS_RETRY_DELAY_MS, 'videos_youtube_rss_http_retry')
 					continue
 				}
 				logger('VIDEOS_YTRSS feed failed', `source=${key}`, `status=${response.status}`, response.statusText || '')
@@ -1760,7 +1993,7 @@ async function fetchYoutubeRssEntriesForSource(source, { logger }) {
 			trackApiResult('youtuberss', isTimeoutLikeError(e) ? 'timeout' : 'failed')
 			if (isTransientApiError(e) && !retriedTransient) {
 				retriedTransient = true
-				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS)
+				await sleep(YOUTUBE_RSS_RETRY_DELAY_MS, 'videos_youtube_rss_transient_retry')
 				continue
 			}
 			logger('VIDEOS_YTRSS feed error', `source=${key}`, String(e?.message || e))
@@ -1938,16 +2171,15 @@ async function chooseRelevantYoutubeUploadVideo({ story, source, channelUrl, cha
 			title: String(v?.title || '').trim(),
 			author: String(v?.author || '').trim(),
 			description: String(v?.description || '').trim(),
+			publishedAt: String(v?.publishedAt || '').trim(),
 		}))
 		.filter(v => v.url)
 		.filter(v => !currentVideos.includes(v.url))
-		.filter(v => {
-			let excluded = isExcludedVideoByChannel({ source, channelTitle, author: v.author })
-			if (excluded) {
-				logger('VIDEOS excluded channel:', `source=${source || 'unknown'}`, `author=${v.author || 'unknown'}`, `video=${v.url}`)
-			}
-			return !excluded
-		})
+	pool = (await Promise.all(pool.map(v => enrichYoutubeVideoCandidate(v, {
+		source,
+		channelTitle,
+		logger,
+	})))).filter(Boolean)
 	if (!pool.length) return null
 
 	let candidateSnippet = pool
@@ -2366,10 +2598,11 @@ async function collectVideosFromYoutubeKeywordSearch(
 	return [selected.videoUrl]
 }
 
-async function searchYoutubeVideosViaGptWebSearch(story, { storyKeywords, logger }) {
+function buildGptVideoWebSearchPayloads(story, storyKeywords) {
 	if (!videoWebSearchEnabled || !openai) return []
 	let querySeeds = buildYoutubeSearchQueries(story, storyKeywords, { openFallback: true })
-	let storyPayload = {
+	let basePayload = {
+		articleTitle: String(story?.articleTitle || '').trim(),
 		titleEn: String(story?.titleEn || '').trim(),
 		titleRu: String(story?.titleRu || '').trim(),
 		url: String(story?.usedUrl || story?.url || '').trim(),
@@ -2380,37 +2613,99 @@ async function searchYoutubeVideosViaGptWebSearch(story, { storyKeywords, logger
 		textSnippet: String(story?.text || '').replace(/\s+/g, ' ').trim().slice(0, 1800),
 		maxCandidates: VIDEO_WEBSEARCH_MAX_CANDIDATES,
 	}
+	return [
+		{
+			name: 'exact_story',
+			payload: {
+				...basePayload,
+				strategyHint: 'exact_story',
+				querySeeds: querySeeds.slice(0, Math.max(YOUTUBE_SEARCH_QUERIES, 4)),
+				maxCandidates: VIDEO_WEBSEARCH_MAX_CANDIDATES,
+			},
+		},
+		{
+			name: 'allowlist_focus',
+			payload: {
+				...basePayload,
+				strategyHint: 'allowlist_focus',
+				querySeeds: querySeeds.slice(0, Math.min(3, Math.max(YOUTUBE_SEARCH_QUERIES, 3))),
+				keywords: (storyKeywords || []).slice(0, 8),
+				maxCandidates: VIDEO_WEBSEARCH_MAX_CANDIDATES,
+			},
+		},
+		{
+			name: 'context_focus',
+			payload: {
+					...basePayload,
+					strategyHint: 'context_focus',
+					querySeeds: uniq([
+						...(querySeeds || []).slice(0, 2),
+						[String(storyOriginalTitle(story) || '').trim(), ...(storyKeywords || []).slice(0, 5)].filter(Boolean).join(' '),
+					]).slice(0, Math.max(YOUTUBE_SEARCH_QUERIES, 3)),
+				keywords: (storyKeywords || []).slice(0, 10),
+				textSnippet: String(story?.text || '').replace(/\s+/g, ' ').trim().slice(0, 2600),
+				maxCandidates: VIDEO_WEBSEARCH_MAX_CANDIDATES,
+			},
+		},
+	].slice(0, VIDEO_WEBSEARCH_PARALLEL_REQUESTS)
+}
+
+async function searchYoutubeVideosViaGptWebSearch(story, { storyKeywords, logger }) {
+	let payloads = buildGptVideoWebSearchPayloads(story, storyKeywords)
+	if (!payloads.length) return []
 
 	try {
 		let system = await getPrompt(spreadsheetId, VIDEO_WEBSEARCH_PROMPT_NAME)
-		let built = buildResponsesWebSearchRequest({
-			model: videoWebSearchModel,
-			system,
-			user: JSON.stringify(storyPayload),
-			temperature: VIDEO_WEBSEARCH_TEMPERATURE,
-			webSearchOptions: videoWebSearchOptions(),
-			responseFormat: VIDEO_WEBSEARCH_RESPONSE_FORMAT,
-			reasoningEffort: VIDEO_WEBSEARCH_REASONING_EFFORT,
-		})
-		let res = await openai.post('/responses', { body: built.request })
-		estimateAndLogCost({
-			task: 'video_websearch',
-			model: videoWebSearchModel,
-			usage: res?.usage,
-			response: res,
-			fallbackWebSearchCalls: 1,
-			logger,
-		})
-		let raw = extractResponseOutputText(res)
-		let videos = parseGptVideoWebSearchOutput(raw).slice(0, VIDEO_WEBSEARCH_MAX_CANDIDATES)
+		let settled = await Promise.allSettled(payloads.map(async ({ name, payload }) => {
+			logger(
+				'VIDEOS gpt-websearch request:',
+				`strategy=${name}`,
+				`model=${videoWebSearchModel}`,
+				`query_seeds=${(payload.querySeeds || []).length}`,
+				`keywords=${(payload.keywords || []).length}`,
+			)
+			let built = buildResponsesWebSearchRequest({
+				model: videoWebSearchModel,
+				system,
+				user: JSON.stringify(payload),
+				temperature: VIDEO_WEBSEARCH_TEMPERATURE,
+				webSearchOptions: videoWebSearchOptions(),
+				responseFormat: VIDEO_WEBSEARCH_RESPONSE_FORMAT,
+				reasoningEffort: VIDEO_WEBSEARCH_REASONING_EFFORT,
+			})
+			let res = await openai.post('/responses', { body: built.request })
+			estimateAndLogCost({
+				task: 'video_websearch',
+				model: videoWebSearchModel,
+				usage: res?.usage,
+				response: res,
+				fallbackWebSearchCalls: 1,
+				logger,
+			})
+			let raw = extractResponseOutputText(res)
+			let videos = parseGptVideoWebSearchOutput(raw).slice(0, VIDEO_WEBSEARCH_MAX_CANDIDATES)
+			logger(
+				'VIDEOS gpt-websearch result:',
+				`strategy=${name}`,
+				`model=${videoWebSearchModel}`,
+				`candidates=${videos.length}`,
+			)
+			return videos
+		}))
+		let videos = uniqByUrl(
+			settled
+				.filter(result => result.status === 'fulfilled')
+				.flatMap(result => result.value || [])
+		).slice(0, VIDEO_WEBSEARCH_MAX_CANDIDATES)
 		logger(
-			'VIDEOS_GPTWEBSEARCH result:',
+			'VIDEOS gpt-websearch merged:',
 			`model=${videoWebSearchModel}`,
+			`parallel=${payloads.length}`,
 			`candidates=${videos.length}`,
 		)
 		return videos
 	} catch (e) {
-		logger('VIDEOS_GPTWEBSEARCH failed', String(e?.message || e))
+		logger('VIDEOS gpt-websearch failed', String(e?.message || e))
 		return []
 	}
 }
@@ -2431,18 +2726,19 @@ async function collectVideosFromGptWebSearch(
 	let enriched = (await Promise.all(found.map(async row => {
 		let url = normalizeYoutubeUrl(row?.url)
 		if (!url || currentVideos.includes(url)) return null
-		let meta = await fetchYoutubeMetadata(url, logger)
-		let merged = {
+		let source = String(row?.source || '').trim()
+		return await enrichYoutubeVideoCandidate({
 			url,
-			source: String(row?.source || meta.author || '').trim(),
-			channelTitle: String(meta.author || row?.source || '').trim(),
-			author: String(meta.author || row?.source || '').trim(),
-			title: String(meta.title || row?.title || '').trim(),
-			description: String(meta.description || '').trim(),
+			source,
+			title: String(row?.title || '').trim(),
+			author: source,
+			description: '',
 			publishedAt: String(row?.publishedAt || '').trim(),
-		}
-		if (isExcludedVideoByChannel(merged)) return null
-		return merged
+		}, {
+			source,
+			channelTitle: source,
+			logger,
+		})
 	}))).filter(Boolean)
 	if (!enriched.length) return []
 
@@ -2488,9 +2784,9 @@ async function collectVideosFromGptWebSearch(
 
 	let selected = await chooseRelevantYoutubeUploadVideo({
 		story,
-		source: 'gpt_websearch',
+		source: 'gpt-websearch',
 		channelUrl: '',
-		channelTitle: 'gpt_websearch',
+		channelTitle: 'gpt-websearch',
 		videos: videosToVerify,
 		currentVideos,
 		logger,
@@ -2514,27 +2810,13 @@ async function chooseRelevantVideo({ story, candidate, candidateHtml, candidateS
 
 	let attempts = found.slice(0, MAX_VERIFY_VIDEOS_PER_PAGE)
 	let videos = (await Promise.all(attempts.map(async (videoUrl) => {
-		let meta = await fetchYoutubeMetadata(videoUrl, logger)
-		let excluded = isExcludedVideoByChannel({
-			source: candidate?.source,
-			channelTitle: '',
-			author: meta.author,
-		})
-		if (excluded) {
-			logger(
-				'VIDEOS excluded channel:',
-				`source=${candidate?.source || 'unknown'}`,
-				`author=${meta.author || 'unknown'}`,
-				`video=${videoUrl}`,
-			)
-			return null
-		}
-		return {
+		return await enrichYoutubeVideoCandidate({
 			url: videoUrl,
-			title: meta.title,
-			author: meta.author,
-			description: meta.description,
-		}
+			source: candidate?.source,
+		}, {
+			source: candidate?.source,
+			logger,
+		})
 	}))).filter(Boolean)
 	if (!videos.length) return null
 
@@ -2578,6 +2860,42 @@ async function chooseRelevantVideo({ story, candidate, candidateHtml, candidateS
 		relevantFound: matched.length,
 		checked: videos.length,
 	}
+}
+
+async function collectVideosFromExactArticleHtml(story, { logger, currentVideos }) {
+	let html = String(story?.html || '').trim()
+	if (!html) {
+		logger('VIDEOS exact article html: missing')
+		return []
+	}
+
+	let found = extractYoutubeUrlsFromHtml(html)
+	logger('VIDEOS exact article html candidates:', found.length)
+	if (!found.length) return []
+
+	let selected = await chooseRelevantVideo({
+		story,
+		candidate: {
+			url: normalizeHttpUrl(story?.usedUrl || story?.url),
+			source: String(story?.source || '').trim(),
+			title: String(story?.articleTitle || story?.titleEn || story?.titleRu || '').trim(),
+			publishedAt: String(story?.date || '').trim(),
+		},
+		candidateHtml: html,
+		candidateSnippet: htmlToSnippet(html, VERIFY_SNIPPET_MAX_CHARS),
+		currentVideos,
+		logger,
+	})
+	if (!selected) return []
+
+	logger(
+		'VIDEOS from exact article html:',
+		`picked=1/${selected.checked || selected.totalFound}`,
+		`relevant=${selected.relevantFound || 1}/${selected.totalFound}`,
+		`verify_confidence=${selected.verdict.confidence.toFixed(2)}`,
+		selected.meta?.title ? `video_title=${selected.meta.title.slice(0, 80)}` : '',
+	)
+	return [selected.videoUrl]
 }
 
 async function collectVideosFromTrustedPages({
@@ -2688,9 +3006,9 @@ export function describeVideoCollectionSettings() {
 			: 'ytapi=off config_disabled'
 	let ytSearchLabel = `ytsearch=allowlist_then_open search_queries=${YOUTUBE_SEARCH_QUERIES} results_per_query=${YOUTUBE_SEARCH_RESULTS_PER_QUERY} open_fallback=${YOUTUBE_OPEN_FALLBACK_ENABLED ? 'on' : 'off'}`
 	let gptWebLabel = videoWebSearchEnabled
-		? `gpt_websearch=on model=${videoWebSearchModel} max_candidates=${VIDEO_WEBSEARCH_MAX_CANDIDATES}`
+		? `gpt_websearch=on model=${videoWebSearchModel} parallel=${VIDEO_WEBSEARCH_PARALLEL_REQUESTS} max_candidates=${VIDEO_WEBSEARCH_MAX_CANDIDATES}`
 		: 'gpt_websearch=off'
-	return `strategy=ytapi_then_ytrss_then_ytsearch_then_pages_then_open_search_then_gpt_websearch ${verifyLabel} ${ytLabel} ytrss=fallback ${ytSearchLabel} ${gptWebLabel} date_window=+/-${DATE_WINDOW_DAYS}d fallback_if_missing=today+/-${FALLBACK_DATE_WINDOW_DAYS}d max_video_urls=${MAX_VIDEO_URLS} max1video_per_source excluded_channels=Al_Jazeera yt_verify_per_source=${YOUTUBE_VERIFY_VIDEOS_PER_SOURCE} yt_verify_per_story=${YOUTUBE_VERIFY_VIDEOS_PER_STORY} trusted_sources=${TRUSTED_VIDEO_SOURCES.join(' | ')}`
+	return `strategy=article_html_then_ytapi_then_ytrss_then_ytsearch_then_pages_then_open_search_then_gpt_websearch ${verifyLabel} ${ytLabel} ytrss=fallback ${ytSearchLabel} ${gptWebLabel} date_window=+/-${DATE_WINDOW_DAYS}d fallback_if_missing=today+/-${FALLBACK_DATE_WINDOW_DAYS}d max_video_urls=${MAX_VIDEO_URLS} max1video_per_source excluded_channels=Al_Jazeera yt_verify_per_source=${YOUTUBE_VERIFY_VIDEOS_PER_SOURCE} yt_verify_per_story=${YOUTUBE_VERIFY_VIDEOS_PER_STORY} trusted_sources=${TRUSTED_VIDEO_SOURCES.join(' | ')}`
 }
 
 export async function collectVideosFromTrustedSources(story, { logger = console.log } = {}) {
@@ -2722,6 +3040,13 @@ export async function collectVideosFromTrustedSources(story, { logger = console.
 		`yt_verify_per_source=${YOUTUBE_VERIFY_VIDEOS_PER_SOURCE}`,
 		`yt_verify_per_story=${YOUTUBE_VERIFY_VIDEOS_PER_STORY}`,
 	)
+
+	let exactArticleVideos = await collectVideosFromExactArticleHtml(story, {
+		logger,
+		currentVideos: videos,
+	})
+	if (exactArticleVideos.length) videos = uniq(videos.concat(exactArticleVideos)).slice(0, MAX_VIDEO_URLS)
+	if (videos.length >= MAX_VIDEO_URLS) return videos.join('\n')
 
 	let ytapiVideos = await collectVideosFromYoutubeApi(story, {
 		originMs,
@@ -2767,6 +3092,20 @@ export async function collectVideosFromTrustedSources(story, { logger = console.
 		if (videos.length >= MAX_VIDEO_URLS) return videos.join('\n')
 	}
 
+	if (videos.length < MAX_VIDEO_URLS) {
+		let gptWeb = await collectVideosFromGptWebSearch(story, {
+			originMs,
+			windowDays,
+			fallbackUnknownDateToNow,
+			storyKeywords,
+			logger,
+			currentVideos: videos,
+			verifyBudget,
+		})
+		if (gptWeb.length) videos = uniq(videos.concat(gptWeb)).slice(0, MAX_VIDEO_URLS)
+		if (videos.length >= MAX_VIDEO_URLS) return videos.join('\n')
+	}
+
 	if (youtubeAuthBroken) {
 		logger('VIDEOS_YTAPI disabled -> switching to page/search fallback only', youtubeAuthBrokenReason || 'auth_error')
 	}
@@ -2785,18 +3124,6 @@ export async function collectVideosFromTrustedSources(story, { logger = console.
 				mode: 'open',
 			})
 			if (ytsearchOpen.length) videos = uniq(videos.concat(ytsearchOpen)).slice(0, MAX_VIDEO_URLS)
-		}
-		if (videos.length < MAX_VIDEO_URLS) {
-			let gptWeb = await collectVideosFromGptWebSearch(story, {
-				originMs,
-				windowDays,
-				fallbackUnknownDateToNow,
-				storyKeywords,
-				logger,
-				currentVideos: videos,
-				verifyBudget,
-			})
-			if (gptWeb.length) videos = uniq(videos.concat(gptWeb)).slice(0, MAX_VIDEO_URLS)
 		}
 		return videos.join('\n')
 	}
@@ -2924,19 +3251,6 @@ export async function collectVideosFromTrustedSources(story, { logger = console.
 			mode: 'open',
 		})
 		if (ytsearchOpen.length) videos = uniq(videos.concat(ytsearchOpen)).slice(0, MAX_VIDEO_URLS)
-	}
-
-	if (videos.length < MAX_VIDEO_URLS) {
-		let gptWeb = await collectVideosFromGptWebSearch(story, {
-			originMs,
-			windowDays,
-			fallbackUnknownDateToNow,
-			storyKeywords,
-			logger,
-			currentVideos: videos,
-			verifyBudget,
-		})
-		if (gptWeb.length) videos = uniq(videos.concat(gptWeb)).slice(0, MAX_VIDEO_URLS)
 	}
 
 	return uniq(videos).slice(0, MAX_VIDEO_URLS).join('\n')
